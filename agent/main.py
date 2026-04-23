@@ -25,6 +25,7 @@ from agent import conversation_handler as conv
 from agent import booking_handler as booking
 from agent import hubspot_sync as hs
 from agent import langfuse_logger as lf
+from agent import sms_handler as sms_mod
 
 _CALCOM_API_KEY = os.getenv("CALCOM_API_KEY", "")   # set if Cal.com auth is required
 
@@ -134,20 +135,36 @@ async def webhook_email(request: Request):
 
 @app.post("/webhooks/sms")
 async def webhook_sms(request: Request):
+    """
+    Africa's Talking inbound SMS callback.
+
+    Channel hierarchy: SMS is only processed for warm leads (leads that have
+    already received email outreach).  Cold contacts are logged and dropped —
+    their first-contact channel is email only.  Warm leads are routed to
+    _run_reply_pipeline so qualification and booking logic runs identically
+    to email replies.
+    """
     body = await request.json()
-    # Africa's Talking sends: {"from": "+2547...", "text": "...", ...}
+    # Africa's Talking payload: {"from": "+2547...", "text": "...", "to": "SENDER_ID"}
     phone = body.get("from", "")
     text = body.get("text", "")
 
-    # Use phone as the identifier; no enrichment for SMS-only
-    lead = conv.get_or_create(phone)
-    trace_id = lf.log_trace("sms_reply", {"phone": phone, "text": text}, None)
-    agent_reply = conv._llm_reply(lead.history + [{"role": "user", "content": text}], trace_id)
-    lead.history.append({"role": "user", "content": text})
-    lead.history.append({"role": "assistant", "content": agent_reply})
+    if not phone:
+        return JSONResponse({"error": "missing phone"}, status_code=400)
 
-    lf.log_trace("sms_complete", {"phone": phone}, agent_reply, session_id=lead.lead_id)
-    return JSONResponse({"reply": agent_reply, "lead_id": lead.lead_id})
+    trace_id = lf.log_trace("sms_inbound", {"phone": phone, "text": text}, None)
+
+    lead = conv.get_or_create(phone)
+    result = sms_mod.handle_inbound_sms(
+        phone=phone,
+        text=text,
+        lead_status=lead.status,
+        trace_id=trace_id,
+        reply_pipeline_fn=_run_reply_pipeline,
+    )
+
+    lf.log_trace("sms_complete", {"phone": phone}, result, session_id=lead.lead_id)
+    return JSONResponse(result)
 
 
 @app.post("/simulate")

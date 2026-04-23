@@ -3,6 +3,9 @@
 .env.local
 *.env
 
+# tau2-bench — excluded from this repo
+tau2-bench/
+
 # Python
 __pycache__/
 *.py[cod]

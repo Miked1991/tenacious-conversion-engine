@@ -1,0 +1,33 @@
+# Credentials — never commit
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# tau2-bench venv and large data
+tau2-bench/.venv/
+tau2-bench/data/simulations/
+tau2-bench/uv.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log

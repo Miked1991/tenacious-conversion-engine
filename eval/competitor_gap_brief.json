@@ -1,0 +1,28 @@
+{
+  "prospect": "TechStartup",
+  "segment": "recently_funded",
+  "ai_maturity_score": 3,
+  "competitors": [
+    {
+      "name": "Linear",
+      "positioning": "Project management optimized for async-first engineering teams with clean UX and API-driven workflows",
+      "gap": "Lacks AI-powered predictive task routing and auto-escalation for stalled work items",
+      "tenacious_advantage": "Deep integrations with GitHub and Slack, cult-like adoption among remote-first startups"
+    },
+    {
+      "name": "Shortcut",
+      "positioning": "Story-driven sprint planning with intuitive backlog grooming and team velocity analytics",
+      "gap": "No AI-driven dependency mapping or automated sprint goal recommendations based on historical throughput",
+      "tenacious_advantage": "Best-in-class narrative-based workflow that reduces meeting overhead for product teams"
+    },
+    {
+      "name": "Plane",
+      "positioning": "Open-source, self-hostable alternative with modular features and community-driven roadmap",
+      "gap": "No built-in AI assistants for task summarization, priority scoring, or natural language task creation",
+      "tenacious_advantage": "Zero licensing cost and full data control, appealing to compliance-sensitive engineering orgs"
+    }
+  ],
+  "top_gap_summary": "None of the top competitors leverage AI to reduce cognitive load in task prioritization, sprint planning, or progress prediction\u2014creating an opening for an AI-native tool that auto-adapts to team velocity and surfacing hidden bottlenecks without manual configuration.",
+  "recommended_angle": "AI that learns your team\u2019s rhythm: auto-prioritize, predict delays, and suggest sprint adjustments\u2014without you lifting a finger.",
+  "generated_at": "2026-04-23T18:00:00Z"
+}

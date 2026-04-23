@@ -1,0 +1,109 @@
+{
+  "n": 20,
+  "p50_s": 29.255,
+  "p95_s": 36.302,
+  "min_s": 27.058,
+  "max_s": 38.356,
+  "details": [
+    {
+      "email": "alice.chen@techstartup.io",
+      "ok": true,
+      "latency_s": 31.573
+    },
+    {
+      "email": "bob.smith@growthco.ai",
+      "ok": true,
+      "latency_s": 29.606
+    },
+    {
+      "email": "carol.jones@fundednow.com",
+      "ok": true,
+      "latency_s": 31.574
+    },
+    {
+      "email": "david.lee@leancorp.net",
+      "ok": true,
+      "latency_s": 28.549
+    },
+    {
+      "email": "eve.martin@scalefast.dev",
+      "ok": true,
+      "latency_s": 35.516
+    },
+    {
+      "email": "frank.wu@techstartup.io",
+      "ok": true,
+      "latency_s": 28.634
+    },
+    {
+      "email": "grace.kim@growthco.ai",
+      "ok": true,
+      "latency_s": 28.561
+    },
+    {
+      "email": "henry.patel@fundednow.com",
+      "ok": true,
+      "latency_s": 27.169
+    },
+    {
+      "email": "iris.nguyen@leancorp.net",
+      "ok": true,
+      "latency_s": 28.788
+    },
+    {
+      "email": "jack.brown@scalefast.dev",
+      "ok": true,
+      "latency_s": 32.515
+    },
+    {
+      "email": "karen.white@innovate.io",
+      "ok": true,
+      "latency_s": 33.202
+    },
+    {
+      "email": "liam.davis@nextseries.ai",
+      "ok": true,
+      "latency_s": 27.058
+    },
+    {
+      "email": "mia.wilson@turbogrowth.com",
+      "ok": true,
+      "latency_s": 27.442
+    },
+    {
+      "email": "noah.taylor@buildfast.dev",
+      "ok": true,
+      "latency_s": 28.466
+    },
+    {
+      "email": "olivia.anderson@stepup.co",
+      "ok": true,
+      "latency_s": 28.216
+    },
+    {
+      "email": "peter.thomas@funded2024.io",
+      "ok": true,
+      "latency_s": 31.154
+    },
+    {
+      "email": "quinn.jackson@agile.ai",
+      "ok": true,
+      "latency_s": 36.194
+    },
+    {
+      "email": "rachel.harris@scale2x.dev",
+      "ok": true,
+      "latency_s": 28.903
+    },
+    {
+      "email": "sam.martin@hyperco.io",
+      "ok": true,
+      "latency_s": 35.057
+    },
+    {
+      "email": "tara.garcia@momentum.ai",
+      "ok": true,
+      "latency_s": 38.356
+    }
+  ]
+}

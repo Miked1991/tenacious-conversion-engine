@@ -1,0 +1,41 @@
+{
+  "avg_agent_cost": 0.0199,
+  "domain": "retail",
+  "evaluated_simulations": 150,
+  "git_commit": "d11a97072c49d093f7b5a3e4fe9da95b490d43ba",
+  "infra_error_count": 0,
+  "num_trials": 5,
+  "p50_latency_seconds": 105.9521,
+  "p95_latency_seconds": 551.6491,
+  "pass_at_1": 0.7267,
+  "pass_at_1_ci_95": [
+    0.6504,
+    0.7917
+  ],
+  "total_tasks": 30,
+  "production_agent_latency": {
+    "n_interactions": 20,
+    "p50_s": 29.255,
+    "p95_s": 36.302,
+    "min_s": 27.058,
+    "max_s": 38.356,
+    "note": "wall-clock time for full pipeline: enrich + compose + tone-check + send + HubSpot sync"
+  },
+  "hubspot_contact": {
+    "contact_id": "763473259711",
+    "email": "alice.chen@techstartup.io",
+    "lifecycle_stage": "opportunity",
+    "lead_status": "CONNECTED",
+    "url": "https://app-eu1.hubspot.com/contacts/148323573/contact/763473259711/"
+  },
+  "calcom_booking": {
+    "booking_id": 18709696,
+    "uid": "bc7yCnw3ARAb3J7LSmQUP3",
+    "title": "Discovery-Call between M_I_K_I_A_S D_A_G_E_M and Alice Chen",
+    "status": "accepted",
+    "start": "2026-04-24T06:00:00.000Z",
+    "end": "2026-04-24T06:30:00.000Z",
+    "attendees": ["mikiasdagem@gmail.com", "alice.chen@techstartup.io"],
+    "url": "https://app.cal.com/booking/bc7yCnw3ARAb3J7LSmQUP3"
+  }
+}

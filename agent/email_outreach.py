@@ -1,5 +1,15 @@
 """
-Composes segment-aware outreach emails, validates tone, and sends via Resend.
+Composes segment-aware outreach emails, validates tone, sends via Resend,
+and handles bounce / complaint events from the Resend webhook.
+
+Public interface
+----------------
+compose(profile, trace_id)             → (subject, body)
+tone_check(subject, body, trace_id)    → bool
+send(to, subject, body, trace_id)      → dict  (Resend API response)
+compose_and_send(profile, trace_id)    → dict
+handle_bounce(email, bounce_type, reason, trace_id)  → dict
+handle_complaint(email, trace_id)      → dict
 """
 
 import os
@@ -17,6 +27,8 @@ _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
 _DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3-next-80b-a3b-instruct")
 _RESEND_KEY = os.getenv("RESEND_API_KEY", "")
 _FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
+
+BounceType = Literal["hard", "soft", "complaint"]
 
 _SEGMENT_HINTS = {
     1: (
@@ -60,7 +72,7 @@ def _llm(messages: list, max_tokens: int = 400) -> str:
 
 
 def compose(profile: CompanyProfile, trace_id: str) -> tuple[str, str]:
-    """Return (subject, body). Both are plain text."""
+    """Return (subject, body) as plain text."""
     hint = _SEGMENT_HINTS.get(profile.segment, _SEGMENT_HINTS[0])
     prompt = (
         f"Write a cold outreach email to {profile.company_name} ({profile.domain}).\n"
@@ -77,8 +89,8 @@ def compose(profile: CompanyProfile, trace_id: str) -> tuple[str, str]:
     return subject, body
 
 
-def _tone_check(subject: str, body: str, trace_id: str) -> bool:
-    """Returns True when the email passes the style guide."""
+def tone_check(subject: str, body: str, trace_id: str) -> bool:
+    """Return True when the email passes the style guide."""
     verdict = _llm(
         [
             {
@@ -120,14 +132,52 @@ def send(to: str, subject: str, body: str, trace_id: str) -> dict:
     return result
 
 
+def handle_bounce(
+    email: str,
+    bounce_type: BounceType,
+    reason: str,
+    trace_id: str,
+) -> dict:
+    """
+    Process a Resend email.bounced webhook event.
+
+    bounce_type
+    -----------
+    "hard"      – permanent delivery failure (bad address, domain doesn't exist).
+                  Mark the lead uncontactable; do not retry.
+    "soft"      – transient failure (mailbox full, server timeout).
+                  Eligible for one retry after 24 h.
+    "complaint" – recipient marked as spam.
+                  Suppress immediately; no further contact.
+
+    Returns a structured dict so the orchestrator can update HubSpot accordingly.
+    """
+    should_suppress = bounce_type in ("hard", "complaint")
+    result = {
+        "email": email,
+        "bounce_type": bounce_type,
+        "reason": reason,
+        "suppressed": should_suppress,
+        "retry_eligible": bounce_type == "soft",
+    }
+    log_span(trace_id, "email_bounce", {"email": email, "type": bounce_type}, result)
+    return result
+
+
+def handle_complaint(email: str, trace_id: str) -> dict:
+    """Process a Resend email.complained event — treat as hard suppress."""
+    return handle_bounce(email, "complaint", "spam complaint", trace_id)
+
+
 def compose_and_send(profile: CompanyProfile, trace_id: str) -> dict:
+    """Compose, tone-check (one retry), and send. Returns Resend API response."""
     subject, body = compose(profile, trace_id)
-    if not _tone_check(subject, body, trace_id):
-        subject, body = compose(profile, trace_id)   # one retry
+    if not tone_check(subject, body, trace_id):
+        subject, body = compose(profile, trace_id)   # one retry on tone failure
     return send(profile.email, subject, body, trace_id)
 
 
-# Segment label helper (used by HubSpot sync)
+# Segment label helper (used by HubSpot sync and main.py)
 SEGMENT_LABELS: dict[int, str] = {
     0: "generic",
     1: "recently_funded",

@@ -96,6 +96,34 @@ def upsert_contact(
     return contact_id
 
 
+def mark_bounced(email: str, bounce_type: str, trace_id: str) -> None:
+    """
+    Update the HubSpot lead status when Resend reports a bounce or complaint.
+
+    hard / complaint → hs_lead_status = UNQUALIFIED (suppress permanently)
+    soft             → hs_lead_status = ATTEMPTED_TO_CONTACT (allow retry)
+    """
+    status_map = {
+        "hard": "UNQUALIFIED",
+        "complaint": "UNQUALIFIED",
+        "soft": "ATTEMPTED_TO_CONTACT",
+    }
+    hs_status = status_map.get(bounce_type, "ATTEMPTED_TO_CONTACT")
+    contact_id = _contact_id_by_email(email)
+    if not contact_id:
+        return
+    try:
+        httpx.patch(
+            f"{_BASE}/crm/v3/objects/contacts/{contact_id}",
+            headers=_HEADERS,
+            json={"properties": {"hs_lead_status": hs_status}},
+            timeout=15,
+        )
+    except Exception:
+        pass
+    log_span(trace_id, "hubspot_mark_bounced", {"email": email, "bounce_type": bounce_type}, {"hs_lead_status": hs_status})
+
+
 def log_email_activity(contact_id: str, subject: str, body: str, trace_id: str) -> None:
     if not contact_id:
         return

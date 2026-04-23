@@ -1,29 +1,40 @@
 """
 SMS channel handler — Africa's Talking bidirectional integration.
 
-Channel hierarchy (ENFORCED)
------------------------------
-SMS is a WARM-LEAD channel only.  The rule is applied at the routing layer:
+Warm-lead channel hierarchy (ENFORCED)
+---------------------------------------
+SMS is NEVER used for cold outreach.  The gate is checked at two layers:
 
-  Cold leads  (status == "new", never received email outreach)
-      → SMS refused; cold outreach is email-only.  A reason code is returned
-        so the caller can log the event without further action.
+  Layer 1 – main.py /webhooks/sms:
+      Resolves the inbound phone number to an email-keyed lead via
+      conversation_handler.get_by_phone().  If no matching warm lead exists
+      the request is rejected before reaching this module.
 
-  Warm leads  (status in ["outreach_sent", "in_conversation", "qualified"])
-      → inbound SMS is accepted and routed to conversation_handler.handle_reply()
-        via the reply_pipeline_fn callback, running the same qualification and
-        booking logic as email replies.
+  Layer 2 – handle_inbound_sms() below:
+      Accepts a lead_status argument and returns routed=False with
+      reason="channel_hierarchy_gate" for any status outside the warm set
+      {"outreach_sent", "in_conversation", "qualified"}.
 
-Outbound SMS via send_sms() is used only for warm-lead follow-ups (e.g. booking
-confirmation delivery or a nudge after a qualified lead goes quiet) — never for
-first-contact cold outreach.
+Outbound SMS (send_sms / send_booking_confirmation_sms) is called only from
+_run_reply_pipeline in main.py, after a lead has been qualified and a Cal.com
+booking has been confirmed — never on first contact.
 
-Africa's Talking API
----------------------
-Outbound: POST https://api.africastalking.com/version1/messaging  (live)
-          POST https://api.sandbox.africastalking.com/version1/messaging  (sandbox)
-Inbound:  HTTP callback to /webhooks/sms (configured in AT dashboard)
-          Payload: {"from": "+2547...", "text": "...", "to": "SENDER_ID", ...}
+Africa's Talking API notes
+--------------------------
+Outbound – POST https://api.africastalking.com/version1/messaging
+           Content-Type: application/x-www-form-urlencoded
+           Header: apiKey: <key>
+           Body fields: username, to, message, from (sender ID)
+
+Inbound  – Africa's Talking POSTs application/x-www-form-urlencoded to
+           /webhooks/sms with fields:
+             from        – sender MSISDN  e.g. "+254711XXXXXX"
+             text        – message body
+             to          – recipient shortcode / sender ID
+             date        – delivery timestamp
+             id          – AT message ID
+             linkId      – for premium / subscription messages
+             networkCode – carrier MCC+MNC code
 """
 
 import os
@@ -38,7 +49,7 @@ _AT_USERNAME = os.getenv("AFRICA_TALKING_USERNAME", "sandbox")
 _AT_API_KEY = os.getenv("AFRICA_TALKING_API_KEY", "")
 _AT_SENDER_ID = os.getenv("AFRICA_TALKING_SENDER_ID", "Sandbox")
 
-# Sandbox vs live endpoint chosen based on username
+# Africa's Talking uses different hostnames for sandbox vs live traffic
 _AT_BASE = (
     "https://api.sandbox.africastalking.com"
     if _AT_USERNAME == "sandbox"
@@ -46,24 +57,59 @@ _AT_BASE = (
 )
 _AT_SMS_URL = f"{_AT_BASE}/version1/messaging"
 
-# Lead statuses that indicate prior email contact (warm)
+# Lead statuses that indicate prior email contact (warm lead)
 _WARM_STATUSES = {"outreach_sent", "in_conversation", "qualified"}
 
 
+# ── Payload normalisation ────────────────────────────────────────────────────
+
+def parse_at_payload(raw: dict) -> dict:
+    """
+    Normalise Africa's Talking inbound webhook fields to internal field names.
+
+    AT sends application/x-www-form-urlencoded, not JSON.  Call this after
+    FastAPI decodes the form data with ``await request.form()``.
+
+    AT field → internal field
+    -------------------------
+    from        → phone
+    text        → text
+    to          → shortcode
+    date        → at_date
+    id          → at_message_id
+    linkId      → at_link_id
+    networkCode → network_code
+    """
+    return {
+        "phone": raw.get("from", ""),
+        "text": raw.get("text", ""),
+        "shortcode": raw.get("to", ""),
+        "at_date": raw.get("date", ""),
+        "at_message_id": raw.get("id", ""),
+        "at_link_id": raw.get("linkId", ""),
+        "network_code": raw.get("networkCode", ""),
+    }
+
+
+# ── Outbound SMS ─────────────────────────────────────────────────────────────
+
 def send_sms(phone: str, message: str) -> dict:
     """
-    Send an outbound SMS to `phone` via Africa's Talking.
+    Send an outbound SMS via Africa's Talking.
 
-    Only invoke this for warm leads.  Cold-outreach initiation must go through
+    Only invoke for warm leads.  Cold-outreach initiation must use
     email_outreach.compose_and_send() instead.
+
+    Uses application/x-www-form-urlencoded as required by the AT REST API.
     """
-    payload = {
+    payload: dict[str, str] = {
         "username": _AT_USERNAME,
         "to": phone,
         "message": message,
     }
     if _AT_SENDER_ID:
         payload["from"] = _AT_SENDER_ID
+
     try:
         resp = httpx.post(
             _AT_SMS_URL,
@@ -80,6 +126,26 @@ def send_sms(phone: str, message: str) -> dict:
         return {"error": str(exc)}
 
 
+def send_booking_confirmation_sms(
+    phone: str,
+    booking_title: str,
+    start_time: str,
+    booking_url: str,
+) -> dict:
+    """
+    Send a Cal.com booking confirmation SMS to a warm lead's phone.
+    Called from _run_reply_pipeline in main.py immediately after booking.
+    """
+    message = (
+        f"Confirmed: {booking_title}. "
+        f"Starts {start_time}. "
+        f"Manage at {booking_url}"
+    )
+    return send_sms(phone, message)
+
+
+# ── Inbound routing ──────────────────────────────────────────────────────────
+
 def handle_inbound_sms(
     phone: str,
     text: str,
@@ -88,40 +154,40 @@ def handle_inbound_sms(
     reply_pipeline_fn,
 ) -> dict:
     """
-    Route an inbound SMS reply through the channel hierarchy gate.
+    Route an inbound AT SMS reply through the warm-lead channel hierarchy gate.
+
+    Gate logic (Layer 2)
+    --------------------
+    lead_status must be in _WARM_STATUSES {"outreach_sent", "in_conversation",
+    "qualified"}.  Status "new" means this phone number has no prior email
+    contact and is refused — cold outreach is email-only.
+
+    Warm leads are passed to reply_pipeline_fn (which is _run_reply_pipeline
+    from main.py), so the same qualification scoring and Cal.com booking logic
+    runs regardless of whether the reply arrived via email or SMS.
 
     Parameters
     ----------
-    phone             : sender phone number (Africa's Talking "from" field)
+    phone             : normalised sender MSISDN from parse_at_payload()
     text              : inbound message body
-    lead_status       : current lead status from conversation_handler
-    trace_id          : Langfuse trace ID
-    reply_pipeline_fn : _run_reply_pipeline(identifier, text) from main.py —
-                        the shared downstream handler for both email and SMS replies
-
-    Returns
-    -------
-    dict with "routed" bool and either a "reason" (cold gate) or "result"
-    (downstream pipeline output).
+    lead_status       : current lead status resolved from email-keyed Lead
+    trace_id          : Langfuse trace ID for span logging
+    reply_pipeline_fn : _run_reply_pipeline(identifier, text) from main.py
     """
-    # ── Channel hierarchy gate ────────────────────────────────────────────────
-    # SMS is only allowed for leads that have already been contacted by email.
-    # "new" means no outreach has been sent yet → refuse SMS, enforce email first.
+    # ── Layer 2 warm-lead gate ────────────────────────────────────────────────
     if lead_status not in _WARM_STATUSES:
         return {
             "routed": False,
             "reason": "channel_hierarchy_gate",
             "detail": (
-                "SMS is a warm-lead channel. This contact has not yet received "
-                "email outreach. Initiate contact via email first."
+                f"SMS is a warm-lead channel (requires prior email outreach). "
+                f"Lead status '{lead_status}' is not in warm set {sorted(_WARM_STATUSES)}. "
+                "Initiate first contact via email."
             ),
             "phone": phone,
-            "lead_status": lead_status,
         }
 
-    # ── Warm lead: route to the shared downstream reply pipeline ─────────────
-    # reply_pipeline_fn runs conversation_handler.handle_reply() which handles
-    # qualification scoring and Cal.com booking identically for both channels.
+    # ── Warm lead — delegate to the shared downstream reply pipeline ──────────
     result = reply_pipeline_fn(phone, text)
     result["channel"] = "sms"
     result["phone"] = phone

@@ -3,10 +3,26 @@ FastAPI orchestrator – the single entry point for all incoming webhooks.
 
 Endpoints
 ---------
-POST /webhooks/email   – incoming email (Resend webhook or simulation)
-POST /webhooks/sms     – incoming SMS (Africa's Talking webhook)
-POST /simulate         – synthetic lead injection for testing
+POST /webhooks/email   – Resend inbound email + bounce/complaint events
+POST /webhooks/sms     – Africa's Talking inbound SMS (warm leads only)
+POST /simulate         – synthetic lead injection for end-to-end testing
 GET  /health           – liveness check
+
+SMS channel hierarchy
+---------------------
+/webhooks/sms enforces a two-layer warm-lead gate:
+
+  Layer 1 (here): resolve the inbound phone to an email-keyed lead via
+      conversation_handler.get_by_phone().  If no matching warm lead is
+      found, reject immediately — cold contacts must go through email first.
+
+  Layer 2 (sms_handler.handle_inbound_sms): double-checks lead_status is in
+      {"outreach_sent", "in_conversation", "qualified"} before routing to
+      _run_reply_pipeline.
+
+Outbound SMS is sent by _run_reply_pipeline after a Cal.com booking is
+confirmed, delivering the booking details to the lead's phone via
+sms_handler.send_booking_confirmation_sms().
 """
 
 import os
@@ -27,7 +43,7 @@ from agent import hubspot_sync as hs
 from agent import langfuse_logger as lf
 from agent import sms_handler as sms_mod
 
-_CALCOM_API_KEY = os.getenv("CALCOM_API_KEY", "")   # set if Cal.com auth is required
+_CALCOM_API_KEY = os.getenv("CALCOM_API_KEY", "")
 
 
 @asynccontextmanager
@@ -38,10 +54,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Tenacious Conversion Agent", lifespan=lifespan)
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── pipeline helpers ──────────────────────────────────────────────────────────
 
 def _run_full_pipeline(email: str, text: str) -> dict:
-    """Enrich → compose → send → log.  Called on first contact."""
+    """Enrich → compose → send → log.  Called on first contact (email only)."""
     trace_id = lf.log_trace("first_contact", {"email": email, "text": text}, None)
 
     profile = enrich_mod.enrich(email)
@@ -74,23 +90,31 @@ def _run_full_pipeline(email: str, text: str) -> dict:
     return {"lead_id": lead.lead_id, "status": "outreach_sent", "send_result": send_result}
 
 
-def _run_reply_pipeline(email: str, text: str) -> dict:
-    """Handle a reply: generate response, qualify, book if ready."""
-    trace_id = lf.log_trace("reply", {"email": email, "text": text}, None)
+def _run_reply_pipeline(identifier: str, text: str) -> dict:
+    """
+    Handle a reply from email or SMS: generate response, qualify, book if ready.
 
-    result = conv.handle_reply(email, text, trace_id)
-    lead = conv.get_or_create(email)
+    `identifier` is the email address for email replies or the phone-resolved
+    email for SMS replies (see /webhooks/sms for resolution logic).
+
+    After a qualifying booking is made, sends an SMS confirmation to the lead's
+    phone via Africa's Talking if a phone number is on file.
+    """
+    trace_id = lf.log_trace("reply", {"identifier": identifier, "text": text}, None)
+
+    result = conv.handle_reply(identifier, text, trace_id)
+    lead = conv.get_or_create(identifier)
 
     if result["qualified"] and not lead.booking_url:
-        name_parts = email.split("@")[0].split(".")
+        name_parts = identifier.split("@")[0].split(".") if "@" in identifier else [identifier]
         name = " ".join(p.title() for p in name_parts)
-        booking_result = booking.book(email, name, trace_id, api_key=_CALCOM_API_KEY)
+        booking_result = booking.book(identifier, name, trace_id, api_key=_CALCOM_API_KEY)
         lead.booking_url = booking_result.get("booking_url", "")
 
-        # update HubSpot with booking URL
+        # Update HubSpot with booking URL and CONNECTED status
         profile = lead.profile
         hs.upsert_contact(
-            email=email,
+            email=identifier if "@" in identifier else profile.get("email", identifier),
             first_name=name_parts[0].title(),
             last_name=name_parts[1].title() if len(name_parts) > 1 else "",
             company=profile.get("company_name", ""),
@@ -100,14 +124,25 @@ def _run_reply_pipeline(email: str, text: str) -> dict:
             enrichment_ts=profile.get("enriched_at", ""),
             trace_id=trace_id,
         )
+
+        # Outbound SMS: deliver booking confirmation to lead's phone (warm-lead only)
+        if lead.phone and lead.booking_url:
+            sms_confirmation = sms_mod.send_booking_confirmation_sms(
+                phone=lead.phone,
+                booking_title=booking_result.get("title", "Discovery Call"),
+                start_time=booking_result.get("start", ""),
+                booking_url=lead.booking_url,
+            )
+            result["sms_confirmation"] = sms_confirmation
+
         result["booking_url"] = lead.booking_url
         result["booking_result"] = booking_result
 
-    lf.log_trace("reply_complete", {"email": email}, result, session_id=lead.lead_id)
+    lf.log_trace("reply_complete", {"identifier": identifier}, result, session_id=lead.lead_id)
     return result
 
 
-# ── routes ───────────────────────────────────────────────────────────────────
+# ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -116,7 +151,48 @@ async def health():
 
 @app.post("/webhooks/email")
 async def webhook_email(request: Request):
+    """
+    Handle Resend webhook events.
+
+    Resend sends a JSON body with a "type" field for delivery events:
+      email.bounced   → route to bounce handler (suppress / retry)
+      email.complained→ route to complaint handler (suppress)
+      email.delivered → no action needed
+      (no type field) → treat as an inbound reply from the prospect
+    """
     body = await request.json()
+    event_type = body.get("type", "")
+
+    # ── Bounce event ──────────────────────────────────────────────────────────
+    if event_type == "email.bounced":
+        data = body.get("data", {})
+        to_list = data.get("to", [])
+        email = to_list[0] if to_list else ""
+        bounce_info = data.get("bounce", {})
+        bounce_type = bounce_info.get("type", "soft")   # "hard" | "soft"
+        reason = bounce_info.get("message", "")
+        trace_id = lf.log_trace("email_bounced", {"email": email, "type": bounce_type}, None)
+        bounce_result = email_mod.handle_bounce(email, bounce_type, reason, trace_id)
+        if email:
+            hs.mark_bounced(email, bounce_type, trace_id)
+            lead = conv.get_or_create(email)
+            lead.status = "disqualified"
+        return JSONResponse(bounce_result)
+
+    # ── Complaint event ───────────────────────────────────────────────────────
+    if event_type == "email.complained":
+        data = body.get("data", {})
+        to_list = data.get("to", [])
+        email = to_list[0] if to_list else ""
+        trace_id = lf.log_trace("email_complaint", {"email": email}, None)
+        complaint_result = email_mod.handle_complaint(email, trace_id)
+        if email:
+            hs.mark_bounced(email, "complaint", trace_id)
+            lead = conv.get_or_create(email)
+            lead.status = "disqualified"
+        return JSONResponse(complaint_result)
+
+    # ── Inbound reply / new lead ──────────────────────────────────────────────
     email = body.get("from") or body.get("email", "")
     text = body.get("text") or body.get("body", "")
     thread_id = body.get("thread_id", "")
@@ -138,32 +214,67 @@ async def webhook_sms(request: Request):
     """
     Africa's Talking inbound SMS callback.
 
-    Channel hierarchy: SMS is only processed for warm leads (leads that have
-    already received email outreach).  Cold contacts are logged and dropped —
-    their first-contact channel is email only.  Warm leads are routed to
-    _run_reply_pipeline so qualification and booking logic runs identically
-    to email replies.
+    AT sends application/x-www-form-urlencoded (not JSON).  This endpoint
+    handles both content types for compatibility with local testing.
+
+    Warm-lead gate (Layer 1)
+    ------------------------
+    1. Resolve the inbound phone number to an email-keyed lead via
+       conv.get_by_phone().  No match → cold contact → reject (email first).
+    2. Delegate to sms_handler.handle_inbound_sms() which applies Layer 2
+       status check and routes warm leads to _run_reply_pipeline.
     """
-    body = await request.json()
-    # Africa's Talking payload: {"from": "+2547...", "text": "...", "to": "SENDER_ID"}
-    phone = body.get("from", "")
-    text = body.get("text", "")
+    content_type = request.headers.get("content-type", "")
+
+    # Africa's Talking sends application/x-www-form-urlencoded
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        raw = dict(form)
+    else:
+        # JSON fallback for local simulation / testing
+        raw = await request.json()
+
+    parsed = sms_mod.parse_at_payload(raw)
+    phone = parsed["phone"]
+    text = parsed["text"]
 
     if not phone:
         return JSONResponse({"error": "missing phone"}, status_code=400)
 
     trace_id = lf.log_trace("sms_inbound", {"phone": phone, "text": text}, None)
 
-    lead = conv.get_or_create(phone)
+    # ── Layer 1: warm-lead gate — resolve phone to email-keyed lead ───────────
+    warm_lead = conv.get_by_phone(phone)
+    if warm_lead is None:
+        # No email-keyed lead has this phone → cold contact, reject SMS channel
+        lf.log_trace(
+            "sms_cold_rejected",
+            {"phone": phone, "reason": "no_warm_lead_for_phone"},
+            None,
+        )
+        return JSONResponse(
+            {
+                "routed": False,
+                "reason": "channel_hierarchy_gate",
+                "detail": (
+                    "No warm lead found for this phone number. "
+                    "SMS is a warm-lead channel; first contact must be initiated via email."
+                ),
+            },
+            status_code=200,  # 200 so AT does not retry
+        )
+
+    # ── Layer 2 + downstream routing via sms_handler ─────────────────────────
     result = sms_mod.handle_inbound_sms(
         phone=phone,
         text=text,
-        lead_status=lead.status,
+        lead_status=warm_lead.status,
         trace_id=trace_id,
-        reply_pipeline_fn=_run_reply_pipeline,
+        # Pass email as the identifier so _run_reply_pipeline resolves the right lead
+        reply_pipeline_fn=lambda _phone, _text: _run_reply_pipeline(warm_lead.email, _text),
     )
 
-    lf.log_trace("sms_complete", {"phone": phone}, result, session_id=lead.lead_id)
+    lf.log_trace("sms_complete", {"phone": phone}, result, session_id=warm_lead.lead_id)
     return JSONResponse(result)
 
 
@@ -174,4 +285,42 @@ async def simulate(request: Request):
     email = body.get("email", "prospect@example.com")
     text = body.get("text", "Tell me more about your engineering teams.")
     result = _run_full_pipeline(email, text)
+    return JSONResponse(result)
+
+
+@app.post("/simulate/sms")
+async def simulate_sms(request: Request):
+    """
+    Simulate an inbound AT SMS from a warm lead for integration testing.
+
+    Requires the lead to already exist (via /simulate or /webhooks/email).
+    Links the provided phone to the lead's email, then processes the SMS.
+    """
+    body = await request.json()
+    email = body.get("email", "")
+    phone = body.get("phone", "")
+    text = body.get("text", "Yes, let's talk.")
+
+    if not email or not phone:
+        return JSONResponse({"error": "email and phone required"}, status_code=400)
+
+    # Link phone to the lead so the warm-lead gate resolves it
+    conv.link_phone(email, phone)
+
+    # Synthesise an AT-style form payload and process through the real SMS path
+    raw = {"from": phone, "text": text, "to": "Sandbox"}
+    parsed = sms_mod.parse_at_payload(raw)
+    trace_id = lf.log_trace("sms_simulate", {"email": email, "phone": phone}, None)
+
+    warm_lead = conv.get_by_phone(phone)
+    if warm_lead is None:
+        return JSONResponse({"error": "lead not found after link_phone"}, status_code=500)
+
+    result = sms_mod.handle_inbound_sms(
+        phone=phone,
+        text=parsed["text"],
+        lead_status=warm_lead.status,
+        trace_id=trace_id,
+        reply_pipeline_fn=lambda _p, _t: _run_reply_pipeline(warm_lead.email, _t),
+    )
     return JSONResponse(result)

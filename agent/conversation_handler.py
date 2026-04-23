@@ -31,6 +31,7 @@ QUALIFY_AFTER_TURNS = 3   # mark qualified after this many reply turns
 class Lead:
     lead_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     email: str = ""
+    phone: str = ""                                      # set when AT webhook links phone to lead
     status: LeadStatus = "new"
     history: list[dict] = field(default_factory=list)   # {role, content, ts}
     turns: int = 0
@@ -48,6 +49,21 @@ def get_or_create(email: str) -> Lead:
     if email not in _LEADS:
         _LEADS[email] = Lead(email=email)
     return _LEADS[email]
+
+
+def get_by_phone(phone: str) -> Lead | None:
+    """Reverse-lookup a lead by phone number (secondary identifier)."""
+    for lead in _LEADS.values():
+        if lead.phone == phone:
+            return lead
+    return None
+
+
+def link_phone(email: str, phone: str) -> None:
+    """Associate an Africa's Talking phone number with an email-keyed lead."""
+    lead = _LEADS.get(email)
+    if lead and phone:
+        lead.phone = phone
 
 
 def _llm_reply(history: list[dict], trace_id: str) -> str:

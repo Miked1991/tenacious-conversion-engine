@@ -1,0 +1,131 @@
+# Tenacious Conversion Agent — Evaluation Comparison Report
+
+**Generated:** 2026-04-25T19:49:01Z
+**Crunchbase batch companies:** 10
+**τ²-bench simulations:** 150
+**Ablation simulations per condition:** 50
+
+---
+
+## 1. τ²-bench Evaluation
+
+| Metric | Value |
+|---|---|
+| Domain | retail |
+| Total tasks | 30 |
+| Trials per task | 5 |
+| Simulations | 150 |
+| **pass@1** | **72.7%** |
+| 95% CI | [65.0%, 79.2%] |
+| Avg cost / task | $0.0199 |
+| p50 latency | 106.0s |
+| p95 latency | 551.6s |
+| Infra errors | 0 |
+
+Live integration confirmed: HubSpot contact `763473259711` and Cal.com booking `18709696`.
+
+---
+
+## 2. Ablation Study (Held-Out Slice h101–h110)
+
+| Condition | pass@1 | 95% CI | Avg Cost | p95 Latency |
+|---|---|---|---|---|
+| **A3 — Full System** | **74.0%** | [60.4%, 84.1%] | $0.0225 | 378.4s |
+| A2 — APO Prompt-Tuned | 62.0% | [48.1%, 74.1%] | $0.0171 | 291.5s |
+| A1 — Day 1 Baseline | 52.0% | [38.5%, 65.2%] | $0.0121 | 214.7s |
+
+**Delta A (A3 vs A1): +22.0pp** — z=2.278, p=0.0114 (one-tailed), statistically significant at α=0.05.
+
+---
+
+## 3. Crunchbase Live Batch (10 companies)
+
+| Metric | Value |
+|---|---|
+| Companies processed | 10 |
+| Segment breakdown | {'generic': 10} |
+| Avg AI maturity score | 1.0/3 |
+| **Qualification rate** | **100.0%** (10/10) |
+| Qualification rate 95% CI | [72.2%, 100.0%] |
+| Tone check pass rate | 100.0% |
+| Det. tone guard pass rate | 100.0% |
+| Booking success rate | 0.0% |
+
+**Note:** Enrichment ran in degraded mode (no API keys for Crunchbase ODM, Playwright, PDL); LLM calls used MOCK_LLM=true (OpenRouter key expired). All companies defaulted to segment=generic and ai_maturity=1(Low). Results reflect pipeline structural integrity, not full signal depth.
+
+### Per-Company Results
+
+| Company | Domain | Segment | AI Maturity | Tone OK | Qualified | Turns |
+|---|---|---|---|---|---|---|
+| Amerisk Engineering | ameriskengineering.com | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Connect It Utilities | cius.co.uk | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Consolety | consolety.net | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Constantin Hang Machine Production | hang.de | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Western Borders | westernborders.com | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Winder Research | winderresearch.com | generic | 1 (Low) | ✓ | ✓ | 3 |
+| winVS software AG | winvs.ch | generic | 1 (Low) | ✓ | ✓ | 3 |
+| Wiring Technologies | wiringtech.com | generic | 1 (Low) | ✓ | ✓ | 3 |
+| WISEiTECH | wise.co.kr | generic | 1 (Low) | ✓ | ✓ | 3 |
+| World of Wanderlust | worldofwanderlust.com | generic | 1 (Low) | ✓ | ✓ | 3 |
+
+---
+
+## 4. Cross-Evaluation Comparison
+
+### Score Alignment
+
+| Evaluation | pass@1 | 95% CI |
+|---|---|---|
+| τ²-bench (150 sims, retail) | 72.7% | [65.0%, 79.2%] |
+| Ablation A3 (50 sims, held-out) | 74.0% | [60.4%, 84.1%] |
+| Ablation A2 (50 sims, held-out) | 62.0% | [48.1%, 74.1%] |
+| Ablation A1 (50 sims, held-out) | 52.0% | [38.5%, 65.2%] |
+
+τ²-bench and Ablation A3 CIs fully overlap — **consistent performance across both evaluation protocols.**
+Delta τ²-bench vs A3: -1.3pp (not significant; within CI).
+
+### Method vs Baselines
+
+| Comparison | Delta | Significant? |
+|---|---|---|
+| A3 vs A1 (Day 1) | +22.0pp | Yes (p=0.0114) |
+| A3 vs A2 (APO) | +12.0pp | Not tested |
+| τ²-bench vs A1 | +20.7pp | — |
+
+### Cost Analysis
+
+| Condition | Cost/task | vs A1 |
+|---|---|---|
+| A3 — Full System | $0.0225 | +86.0% |
+| A2 — APO | $0.0171 | +41.3% |
+| A1 — Day 1 | $0.0121 | baseline |
+| τ²-bench avg | $0.0199 | — |
+
+At 200 leads/month: A3 incremental cost vs A1 = **$2.08/month** for a +22.0pp qualification lift.
+
+---
+
+## 5. Known Gaps
+
+| ID | Gap | Mitigation |
+|---|---|---|
+| G1 | Enrichment signal depth | Configure CRUNCHBASE_API_KEY, PDL_API_KEY, and install Playwright. |
+| G2 | OpenRouter API key expired | Renew OpenRouter API key; set DEV_MODEL=qwen/qwen3.5-35b-a3b. |
+| G3 | Cal.com event type not found | Verify CALCOM_EVENT_TYPE_SLUG via GET /api/v1/event-types. |
+| G4 | τ²-bench domain mismatch | Build a Tenacious-specific τ²-bench task suite (outbound B2B sales scenarios). Probe library (probes/probe_library.md) provides 36 ready-made failure modes. |
+
+---
+
+## 6. Recommendations
+
+| Priority | Action | Rationale |
+|---|---|---|
+| 1 | Renew the OpenRouter API key | All LLM-dependent pipeline steps (email compose, conversation, qualification) ar... |
+| 2 | Configure enrichment API keys (Crunchbase ODM, PDL) | Without these, all companies default to segment=generic and ai_maturity=1. Riche... |
+| 3 | Fix the Cal.com event type slug | 0/10 bookings succeeded. A working Cal.com integration converts qualified leads ... |
+| 4 | Build a Tenacious-specific τ²-bench task suite | The retail τ²-bench domain is a proxy. Using probe_library.md as the seed, 10–20... |
+| 5 | Ship the bench-availability guard (Probe P11–P13 fix) | The highest-severity unresolved failure mode. Cost: $1,200 (8h dev). Expected sa... |
+
+---
+
+*Report generated by `scripts/generate_comparison_report.py`.*

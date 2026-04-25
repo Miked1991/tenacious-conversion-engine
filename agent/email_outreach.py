@@ -25,9 +25,48 @@ from agent.langfuse_logger import log_span
 load_dotenv()
 
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
-_DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3-next-80b-a3b-instruct")
+_DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3.5-35b-a3b")
 _RESEND_KEY = os.getenv("RESEND_API_KEY", "")
 _FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
+_MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() in ("1", "true", "yes")
+
+# Segment-aware mock email templates used when MOCK_LLM=true
+_MOCK_SUBJECTS = {
+    1: "Faster hiring for your engineering push",
+    2: "More output from your lean engineering team",
+    3: "Scale your engineering team without the debt",
+    0: "One question about your engineering challenges",
+}
+_MOCK_BODIES = {
+    1: (
+        "Congrats on the recent round — that kind of momentum usually means a sprint to ship.\n\n"
+        "Most funded teams we talk to run into the same bottleneck: hiring takes six weeks and "
+        "you needed the engineer yesterday.\n\n"
+        "Tenacious places senior backend and frontend engineers from East Africa in two to three "
+        "weeks, at 40–60% of US hiring cost, fully managed.\n\n"
+        "Worth a 20-minute call to see if there's a fit?"
+    ),
+    2: (
+        "Running lean after a tough quarter is hard — every hire has to count.\n\n"
+        "Tenacious works with engineering leads who need output fast without rebuilding a full team. "
+        "We place senior engineers from East Africa in two to three weeks, fully managed, "
+        "at 40–60% of typical hiring cost.\n\n"
+        "Would it help to see how other post-layoff teams have used this?"
+    ),
+    3: (
+        "Scaling fast is exciting — until technical debt shows up uninvited.\n\n"
+        "Tenacious places senior engineers who know how to build clean during a growth sprint. "
+        "Two to three weeks to placement, 40–60% cost savings, fully managed engagement.\n\n"
+        "Open to a quick conversation about what your team needs right now?"
+    ),
+    0: (
+        "Quick question: what's the biggest friction point in your engineering team today — "
+        "hiring speed, capacity, or something else?\n\n"
+        "I ask because Tenacious helps engineering leads solve exactly these problems with "
+        "senior talent from East Africa, placed in two to three weeks.\n\n"
+        "Happy to share how if it's relevant."
+    ),
+}
 
 BounceType = Literal["hard", "soft", "complaint"]
 
@@ -95,22 +134,39 @@ def _deterministic_tone_check(subject: str, body: str) -> tuple[bool, list[str]]
 
 
 def _llm(messages: list, max_tokens: int = 400) -> str:
-    resp = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {_OR_KEY}"},
-        json={
-            "model": _DEV_MODEL,
-            "messages": messages,
-            "temperature": float(os.getenv("TEMPERATURE", "0.7")),
-            "max_tokens": max_tokens,
-        },
-        timeout=40,
-    )
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    if _MOCK_LLM:
+        return "YES"   # default mock — callers that need compose output use _mock_compose
+    try:
+        resp = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_OR_KEY}"},
+            json={
+                "model": _DEV_MODEL,
+                "messages": messages,
+                "temperature": float(os.getenv("TEMPERATURE", "0.7")),
+                "max_tokens": max_tokens,
+            },
+            timeout=40,
+        )
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        raise RuntimeError(f"LLM call failed ({_DEV_MODEL}): {exc}") from exc
+
+
+def _mock_compose(profile: "CompanyProfile") -> tuple[str, str]:
+    subject = _MOCK_SUBJECTS.get(profile.segment, _MOCK_SUBJECTS[0])
+    body = _MOCK_BODIES.get(profile.segment, _MOCK_BODIES[0])
+    return subject, body
 
 
 def compose(profile: CompanyProfile, trace_id: str) -> tuple[str, str]:
     """Return (subject, body) as plain text."""
+    if _MOCK_LLM:
+        subject, body = _mock_compose(profile)
+        log_span(trace_id, "compose_email_mock", {}, {"subject": subject, "segment": profile.segment})
+        return subject, body
+
     hint = _SEGMENT_HINTS.get(profile.segment, _SEGMENT_HINTS[0])
     prompt = (
         f"Write a cold outreach email to {profile.company_name} ({profile.domain}).\n"

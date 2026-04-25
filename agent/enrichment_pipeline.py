@@ -32,6 +32,8 @@ from typing import Any, Literal
 import httpx
 from dotenv import load_dotenv
 
+from agent.ai_maturity import score_ai_maturity
+
 load_dotenv()
 
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -571,6 +573,14 @@ def enrich(email: str) -> CompanyProfile:
             outreach_urgency_boost=ld_val.get("outreach_urgency_boost", 0.0),
         )
 
+    # Deterministic AI maturity scoring — replaces pure LLM delegation
+    det_score, det_reason = score_ai_maturity(
+        job_signal_value=job_val,
+        cb_signal_value=cb_val,
+        domain=domain,
+        llm_estimate=int(raw.get("ai_maturity_score", 1)),
+    )
+
     profile = CompanyProfile(
         email=email,
         domain=domain,
@@ -581,8 +591,8 @@ def enrich(email: str) -> CompanyProfile:
         had_layoffs=bool(raw.get("had_layoffs", False)),
         headcount_growth_pct=float(raw.get("headcount_growth_pct", 0.0)),
         open_engineering_roles=int(raw.get("open_engineering_roles", 0)),
-        ai_maturity_score=int(raw.get("ai_maturity_score", 2)),
-        raw=raw,
+        ai_maturity_score=det_score,
+        raw={**raw, "ai_maturity_reason": det_reason},
         crunchbase_signal=cb_signal.to_dict(),
         job_posts_signal=job_signal.to_dict(),
         layoffs_signal=layoffs_sig.to_dict(),

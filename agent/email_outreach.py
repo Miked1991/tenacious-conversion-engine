@@ -13,6 +13,7 @@ handle_complaint(email, trace_id)      → dict
 """
 
 import os
+import re
 from typing import Literal
 
 import httpx
@@ -54,6 +55,43 @@ _STYLE_GUIDE = (
     "Short sentences. One clear call to action. Under 120 words. "
     "Never mention 'AI' or 'disruption'."
 )
+
+# ── Deterministic tone guards (run before LLM tone-check) ────────────────────
+
+_BANNED_WORDS = re.compile(
+    r"\b(disrupt|disruption|leverage|synergy|artificial intelligence|"
+    r"machine learning|innovative|innovation|revolutionize|game.?changer|"
+    r"paradigm|bleeding.?edge|world.?class|best.?in.?class|cutting.?edge|"
+    r"transformational|empower|unlock|scalable solution|robust solution)\b",
+    re.IGNORECASE,
+)
+_AI_WORD = re.compile(r"\bAI\b")          # case-sensitive: "AI" is banned, "ai" in names is ok
+_MAX_BODY_WORDS = 120
+
+
+def _deterministic_tone_check(subject: str, body: str) -> tuple[bool, list[str]]:
+    """
+    Fast pre-check before LLM tone validation.
+    Returns (passed, violations_list).
+    Catches: word count overrun, banned buzzwords, explicit 'AI' mention.
+    """
+    violations: list[str] = []
+    full_text = f"{subject} {body}"
+
+    word_count = len(body.split())
+    if word_count > _MAX_BODY_WORDS:
+        violations.append(f"body too long ({word_count} words; max {_MAX_BODY_WORDS})")
+
+    banned = _BANNED_WORDS.findall(full_text)
+    if banned:
+        violations.append(
+            f"banned buzzwords: {', '.join(sorted(set(w.lower() for w in banned)))}"
+        )
+
+    if _AI_WORD.search(full_text):
+        violations.append("contains 'AI' (style guide: never mention AI)")
+
+    return len(violations) == 0, violations
 
 
 def _llm(messages: list, max_tokens: int = 400) -> str:
@@ -169,11 +207,41 @@ def handle_complaint(email: str, trace_id: str) -> dict:
     return handle_bounce(email, "complaint", "spam complaint", trace_id)
 
 
-def compose_and_send(profile: CompanyProfile, trace_id: str) -> dict:
-    """Compose, tone-check (one retry), and send. Returns Resend API response."""
+def compose_and_send(profile: CompanyProfile, trace_id: str, dry_run: bool = False) -> dict:
+    """
+    Compose → deterministic guard → LLM tone check → send.
+    Max 2 compose attempts total.
+
+    dry_run=True skips the Resend API call (returns a simulated success dict).
+    Used by the batch CSV runner to avoid sending real emails to CSV contacts.
+    """
     subject, body = compose(profile, trace_id)
+
+    # Gate 1: fast deterministic check (word count, banned words, AI mention)
+    det_ok, violations = _deterministic_tone_check(subject, body)
+    if not det_ok:
+        log_span(
+            trace_id, "tone_check_deterministic_fail",
+            {"violations": violations, "retrying": True}, {}
+        )
+        subject, body = compose(profile, trace_id)   # retry
+
+    # Gate 2: LLM tone check on the (possibly retried) output
     if not tone_check(subject, body, trace_id):
-        subject, body = compose(profile, trace_id)   # one retry on tone failure
+        log_span(trace_id, "tone_check_llm_fail", {"subject": subject[:60]}, {})
+        # Do not retry again — max 2 compose calls total; proceed with current output
+
+    if dry_run:
+        result = {
+            "id": f"dry-run-{trace_id}",
+            "dry_run": True,
+            "subject": subject,
+            "body": body,
+            "to": profile.email,
+        }
+        log_span(trace_id, "send_email_dry_run", {"to": profile.email}, result)
+        return result
+
     return send(profile.email, subject, body, trace_id)
 
 

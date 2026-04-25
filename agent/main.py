@@ -42,6 +42,7 @@ from agent import booking_handler as booking
 from agent import hubspot_sync as hs
 from agent import langfuse_logger as lf
 from agent import sms_handler as sms_mod
+from agent import competitor_gap as gap_mod
 
 _CALCOM_API_KEY = os.getenv("CALCOM_API_KEY", "")
 
@@ -63,11 +64,14 @@ def _run_full_pipeline(email: str, text: str) -> dict:
     profile = enrich_mod.enrich(email)
     lf.log_span(trace_id, "enrich", {"email": email}, profile.__dict__)
 
+    # Generate competitor gap brief (wired here — was missing before)
+    gap_brief = gap_mod.generate_competitor_gap_brief(profile, trace_id)
+
     send_result = email_mod.compose_and_send(profile, trace_id)
 
     lead = conv.get_or_create(email)
     lead.status = "outreach_sent"
-    lead.profile = profile.__dict__
+    lead.profile = {**profile.__dict__, "competitor_gap_brief": gap_brief}
 
     name_parts = email.split("@")[0].split(".")
     first = name_parts[0].title()
@@ -87,7 +91,14 @@ def _run_full_pipeline(email: str, text: str) -> dict:
     lead.hubspot_contact_id = contact_id
 
     lf.log_trace("first_contact_complete", {"email": email}, send_result, session_id=lead.lead_id)
-    return {"lead_id": lead.lead_id, "status": "outreach_sent", "send_result": send_result}
+    return {
+        "lead_id": lead.lead_id,
+        "status": "outreach_sent",
+        "send_result": send_result,
+        "segment": email_mod.SEGMENT_LABELS[profile.segment],
+        "ai_maturity_score": profile.ai_maturity_score,
+        "competitor_gap_brief": gap_brief,
+    }
 
 
 def _run_reply_pipeline(identifier: str, text: str) -> dict:

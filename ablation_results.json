@@ -1,0 +1,61 @@
+{
+  "description": "Ablation study on sealed held-out slice (tasks h101–h110, 10 tasks × 5 trials = 50 simulations per condition).",
+  "held_out_task_ids": ["h101","h102","h103","h104","h105","h106","h107","h108","h109","h110"],
+  "n_tasks": 10,
+  "n_trials": 5,
+  "n_simulations_per_condition": 50,
+  "domain": "retail",
+  "evaluation_date": "2026-04-24",
+  "conditions": {
+    "method": {
+      "id": "A3",
+      "name": "Full System — 4-Source Enrichment + Segment-Aware Compose + Tone Check",
+      "n_pass": 37, "n_fail": 13, "n_simulations": 50,
+      "pass_at_1": 0.7400,
+      "pass_at_1_ci_95": [0.6044, 0.8412],
+      "avg_cost_per_task_usd": 0.0225,
+      "p95_latency_s": 378.4,
+      "p50_latency_s": 118.2,
+      "trace_source": "held_out_traces.jsonl (condition=method)"
+    },
+    "day1_baseline": {
+      "id": "A1",
+      "name": "Day 1 Baseline — Generic LLM Agent (no enrichment, no segment logic)",
+      "n_pass": 26, "n_fail": 24, "n_simulations": 50,
+      "pass_at_1": 0.5200,
+      "pass_at_1_ci_95": [0.3851, 0.6520],
+      "avg_cost_per_task_usd": 0.0121,
+      "p95_latency_s": 214.7,
+      "p50_latency_s": 89.3,
+      "trace_source": "held_out_traces.jsonl (condition=day1_baseline)"
+    },
+    "auto_opt_baseline": {
+      "id": "A2",
+      "name": "Automated-Optimization Baseline — APO Prompt-Tuned (no live enrichment)",
+      "n_pass": 31, "n_fail": 19, "n_simulations": 50,
+      "pass_at_1": 0.6200,
+      "pass_at_1_ci_95": [0.4815, 0.7414],
+      "avg_cost_per_task_usd": 0.0171,
+      "p95_latency_s": 291.5,
+      "p50_latency_s": 102.7,
+      "trace_source": "held_out_traces.jsonl (condition=auto_opt_baseline)"
+    }
+  },
+  "delta_a": {
+    "description": "Delta A = method pass@1 − day1_baseline pass@1 on held-out slice",
+    "delta": 0.2200,
+    "delta_pp": 22.0
+  },
+  "statistical_test": {
+    "test": "Two-proportion z-test (one-tailed, H1: method > day1_baseline)",
+    "n1": 50, "k1": 37, "p1": 0.7400,
+    "n2": 50, "k2": 26, "p2": 0.5200,
+    "pooled_proportion": 0.6300,
+    "standard_error": 0.09656,
+    "z_statistic": 2.278,
+    "p_value_one_tailed": 0.0114,
+    "p_value_two_tailed": 0.0228,
+    "alpha": 0.05,
+    "conclusion": "Delta A is positive and statistically significant (p=0.023 < 0.05). The full enrichment + segment-aware method outperforms the Day 1 generic baseline by 22 percentage points on the sealed held-out slice."
+  }
+}

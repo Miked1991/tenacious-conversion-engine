@@ -37,7 +37,7 @@ from agent.ai_maturity import score_ai_maturity
 load_dotenv()
 
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
-_DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3-next-80b-a3b-instruct")
+_DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 _CB_KEY = os.getenv("CRUNCHBASE_API_KEY", "")
 _PDL_KEY = os.getenv("PDL_API_KEY", "")
 
@@ -574,12 +574,14 @@ def enrich(email: str) -> CompanyProfile:
         )
 
     # Deterministic AI maturity scoring — replaces pure LLM delegation
-    det_score, det_reason = score_ai_maturity(
+    ai_maturity = score_ai_maturity(
         job_signal_value=job_val,
         cb_signal_value=cb_val,
         domain=domain,
         llm_estimate=int(raw.get("ai_maturity_score", 1)),
     )
+    det_score  = ai_maturity["score"]
+    det_reason = ai_maturity["reason"]
 
     profile = CompanyProfile(
         email=email,
@@ -592,7 +594,7 @@ def enrich(email: str) -> CompanyProfile:
         headcount_growth_pct=float(raw.get("headcount_growth_pct", 0.0)),
         open_engineering_roles=int(raw.get("open_engineering_roles", 0)),
         ai_maturity_score=det_score,
-        raw={**raw, "ai_maturity_reason": det_reason},
+        raw={**raw, "ai_maturity_reason": det_reason, "ai_maturity_signals": ai_maturity["signals"]},
         crunchbase_signal=cb_signal.to_dict(),
         job_posts_signal=job_signal.to_dict(),
         layoffs_signal=layoffs_sig.to_dict(),
@@ -601,3 +603,27 @@ def enrich(email: str) -> CompanyProfile:
     )
     profile.segment = _classify_segment(profile)
     return profile
+
+
+def get_company_contacts(company_name: str) -> list[dict]:
+    """Fetch contacts for a Crunchbase company.
+    
+    Args:
+        company_name: Crunchbase company identifier (e.g. "winder-research")
+    
+    Returns:
+        List of contact dicts with email/name/title
+    """
+    if not _CB_KEY:
+        return []
+        
+    try:
+        resp = httpx.get(
+            f"https://api.crunchbase.com/api/v4/entities/organizations/{company_name}",
+            params={"user_key": _CB_KEY},
+            timeout=15
+        )
+        data = resp.json()
+        return data.get("cards", {}).get("founders", [])
+    except Exception:
+        return []

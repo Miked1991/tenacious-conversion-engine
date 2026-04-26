@@ -20,7 +20,7 @@ from agent.langfuse_logger import log_span
 load_dotenv()
 
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
-_DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3.5-35b-a3b")
+_DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 _MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() in ("1", "true", "yes")
 
 _MOCK_AGENT_REPLIES = [

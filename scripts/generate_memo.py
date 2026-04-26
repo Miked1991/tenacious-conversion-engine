@@ -1,36 +1,128 @@
 """
-Generates memo.pdf — EXACTLY 2 pages.
+Generates memo.pdf -- EXACTLY 2 pages.
 Page 1: The Decision
 Page 2: The Skeptic's Appendix
+
+Sources:
+  invoice_summary.json      -- cost ledger
+  eval/trace_log.jsonl      -- tau2-bench agent cost + reward per simulation
+  held_out_traces.jsonl     -- outbound-variant reply/stall rates (A3 vs A1)
+  eval/score_log.json       -- tau2-bench overall pass@1
+  ablation_results.json     -- condition-level pass@1 / stall / cost
+  eval/crunchbase-result/   -- Crunchbase live-batch pipeline run
+
 Run from project root: python scripts/generate_memo.py
 """
 
 import json
+import math
 from datetime import datetime, UTC
 from pathlib import Path
 from fpdf import FPDF
 
 ROOT = Path(__file__).parent.parent
 
-score    = json.loads((ROOT / "eval" / "score_log.json").read_text())
-invoice  = json.loads((ROOT / "invoice_summary.json").read_text())
-ablation = json.loads((ROOT / "ablation_results.json").read_text())
+score    = json.loads((ROOT / "eval" / "score_log.json").read_text(encoding="utf-8"))
+invoice  = json.loads((ROOT / "invoice_summary.json").read_text(encoding="utf-8"))
+ablation = json.loads((ROOT / "ablation_results.json").read_text(encoding="utf-8"))
 
-_MAP = str.maketrans({"'":"'","'":"'","“":'"',"”":'"',"—":"--","–":"-",
-                      "•":"*","→":"->","…":"...","×":"x",
-                      "°":"deg","−":"-","≥":">=","≤":"<=",
-                      "²":"2","µ":"u","τ":"tau"})
-def s(t): return str(t).translate(_MAP).encode("latin-1","replace").decode("latin-1")
+# ── held_out_traces outbound-variant analysis ─────────────────────────────────
+hot_traces: list[dict] = []
+with open(ROOT / "held_out_traces.jsonl", encoding="utf-8") as f:
+    for line in f:
+        try:
+            hot_traces.append(json.loads(line))
+        except Exception:
+            pass
 
-NAVY  = (15, 23, 42)
-INDIGO= (79, 70, 229)
-SLATE = (100,116,139)
-GREEN = (22, 163, 74)
-AMBER = (217,119,  6)
-RED   = (220, 38, 38)
-BGLT  = (248,250,252)
-WHITE = (255,255,255)
+variants: dict[str, dict] = {}
+for t in hot_traces:
+    v = t.get("outbound_variant", "unknown")
+    if v not in variants:
+        variants[v] = {"n": 0, "pass": 0, "stall": 0, "engaged": 0}
+    variants[v]["n"] += 1
+    if t.get("reward", 0) >= 1.0:
+        variants[v]["pass"] += 1
+    if t.get("stalled"):
+        variants[v]["stall"] += 1
+    if t.get("engaged"):
+        variants[v]["engaged"] += 1
+
+rg  = variants.get("research_grounded", {})   # A3
+gen = variants.get("generic", {})             # A1
+rg_reply  = round(rg.get("engaged", 0)  / rg.get("n",  1) * 100, 1)
+gen_reply = round(gen.get("engaged", 0) / gen.get("n", 1) * 100, 1)
+rg_stall  = round(rg.get("stall", 0)   / rg.get("n",  1) * 100, 1)
+gen_stall = round(gen.get("stall", 0)  / gen.get("n",  1) * 100, 1)
+reply_delta = round(rg_reply - gen_reply, 1)
+n_rg  = rg.get("n", 0)
+n_gen = gen.get("n", 0)
+n_total_hot = n_rg + n_gen + sum(
+    v["n"] for k, v in variants.items()
+    if k not in ("research_grounded", "generic")
+)
+frac_rg = f"{n_rg}/{n_rg + n_gen}" if (n_rg + n_gen) > 0 else "N/A"
+
+# ── tau2-bench trace-level stall rate (reward=0 fraction) ────────────────────
+tau2_traces: list[dict] = []
+with open(ROOT / "eval" / "trace_log.jsonl", encoding="utf-8") as f:
+    for line in f:
+        try:
+            tau2_traces.append(json.loads(line))
+        except Exception:
+            pass
+tau2_fail_n  = sum(1 for t in tau2_traces if t.get("reward", 0) < 1.0)
+tau2_total   = len(tau2_traces)
+tau2_stall   = round(tau2_fail_n / tau2_total * 100, 1) if tau2_total else 0
+
+# ── Crunchbase batch summary ──────────────────────────────────────────────────
+cb_files = [f for f in (ROOT / "eval" / "crunchbase-result").glob("crunchbase_*.json")
+            if "summary" not in f.name]
+cb_companies: list[dict] = []
+for f in sorted(cb_files):
+    try:
+        cb_companies.append(json.loads(f.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+cb_n         = len(cb_companies)
+cb_qualified = sum(1 for c in cb_companies if c.get("conversation", {}).get("qualified"))
+cb_tone_ok   = sum(1 for c in cb_companies if c.get("email", {}).get("tone_check"))
+cb_gap_gen   = sum(1 for c in cb_companies if c.get("competitor_gap_brief"))
+cb_qual_pct  = round(cb_qualified / cb_n * 100) if cb_n else 0
+cb_tone_pct  = round(cb_tone_ok / cb_n * 100) if cb_n else 0
+
+# ── Convenience aliases ───────────────────────────────────────────────────────
+pass_at1    = score["pass_at_1"]
+cpl         = invoice["unit_economics"]["cost_per_qualified_lead_usd"]
+total_spend = invoice["totals"]["grand_total_usd"]
+q_leads     = invoice["qualified_leads"]
+headroom    = invoice["unit_economics"]["headroom_vs_target"]
+method_p1   = ablation["conditions"]["method"]["pass_at_1"]
+a1_p1       = ablation["conditions"]["day1_baseline"]["pass_at_1"]
+delta_pp    = ablation["delta_a"]["delta_pp"]
+pval        = ablation["statistical_test"]["p_value_two_tailed"]
+
+# ── PDF helpers ───────────────────────────────────────────────────────────────
+_MAP = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "—": "--", "–": "-", "•": "*", "→": "->",
+    "…": "...", "×": "x", "°": "deg", "−": "-",
+    "≥": ">=", "≤": "<=", "²": "2", "µ": "u",
+    "τ": "tau", "é": "e", "à": "a", "è": "e",
+})
+def s(t: object) -> str:
+    return str(t).translate(_MAP).encode("latin-1", "replace").decode("latin-1")
+
+NAVY  = (15,  23,  42)
+INDIGO= (79,  70, 229)
+SLATE = (100, 116, 139)
+GREEN = (22,  163,  74)
+AMBER = (217, 119,   6)
+RED   = (220,  38,  38)
+BGLT  = (248, 250, 252)
+WHITE = (255, 255, 255)
 L = 14; R = 196; TW = R - L
+
 
 class Memo(FPDF):
     _pg_title = ""
@@ -59,7 +151,8 @@ class Memo(FPDF):
         self.set_text_color(*SLATE)
         self.cell(0, 6,
             f"Tenacious Conversion Engine  |  {datetime.now(UTC).strftime('%Y-%m-%d')}  |"
-            f"  All claims sourced in evidence_graph.json  |  Page {self.page_no()} of 2",
+            f"  Sources: invoice_summary.json, trace_log.jsonl, held_out_traces.jsonl  |  "
+            f"Page {self.page_no()} of 2",
             align="C")
 
     def h1(self, text, col=None):
@@ -77,7 +170,7 @@ class Memo(FPDF):
         self.line(L, self.get_y() - 2, R, self.get_y() - 2)
 
     def h2(self, text):
-        self.ln(2)
+        self.ln(1)
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(*INDIGO)
         self.set_x(L)
@@ -92,17 +185,17 @@ class Memo(FPDF):
         self.multi_cell(TW - indent, 4.8, s(text))
         self.ln(1)
 
-    def kv(self, label, value, lw=58, bk=False):
+    def kv(self, label, value, lw=72):
         self.set_x(L + 3)
-        self.set_font("Helvetica", "B" if bk else "", 8.5)
+        self.set_font("Helvetica", "", 8.2)
         self.set_text_color(*SLATE)
-        self.cell(lw, 5.5, s(label))
-        self.set_font("Helvetica", "B", 8.5)
+        self.cell(lw, 5.2, s(label))
+        self.set_font("Helvetica", "B", 8.2)
         self.set_text_color(*NAVY)
-        self.multi_cell(TW - lw - 3, 5.5, s(str(value)))
+        self.multi_cell(TW - lw - 3, 5.2, s(str(value)))
 
     def metric_box(self, items):
-        n = len(items); bw = TW / n; y0 = self.get_y(); bh = 19
+        n = len(items); bw = TW / n; y0 = self.get_y(); bh = 18
         for i, (label, val, sub, col) in enumerate(items):
             x = L + i * bw
             self.set_fill_color(*BGLT)
@@ -124,9 +217,9 @@ class Memo(FPDF):
         col = col or INDIGO
         y0 = self.get_y()
         self.set_fill_color(*col)
-        self.rect(L, y0, 3, 13, "F")
+        self.rect(L, y0, 3, 14, "F")
         self.set_fill_color(*BGLT)
-        self.rect(L + 3, y0, TW - 3, 13, "F")
+        self.rect(L + 3, y0, TW - 3, 14, "F")
         self.set_xy(L + 6, y0 + 2)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(*NAVY)
@@ -134,46 +227,36 @@ class Memo(FPDF):
         self.set_text_color(*NAVY)
         self.ln(2)
 
-    def bullet_list(self, items, indent=4, size=8.2):
-        self.set_font("Helvetica", "", size)
-        self.set_text_color(*NAVY)
-        for item in items:
-            self.set_x(L + indent)
-            self.cell(4, 5, chr(149))
-            self.multi_cell(TW - indent - 4, 5, s(item))
-
-    def fm(self, label, detail, impact, indent=4):
-        """Failure-mode entry for Skeptic's Appendix."""
-        self.set_x(L + indent)
-        self.set_font("Helvetica", "B", 8.2)
+    def fm(self, label, what, why, fix, cost, impact):
+        """Structured failure-mode entry for Skeptic's Appendix."""
+        INDENT = 3
+        self.set_x(L + INDENT)
+        self.set_font("Helvetica", "B", 8.3)
         self.set_text_color(*NAVY)
         self.cell(0, 5, s(label))
         self.ln(5.5)
-        self.set_x(L + indent + 3)
-        self.set_font("Helvetica", "", 8)
-        self.set_text_color(*SLATE)
-        self.multi_cell(TW - indent - 6, 4.6, s(detail))
-        self.set_x(L + indent + 3)
+        for prefix, body in [
+            ("What: ", what),
+            ("Benchmark gap: ", why),
+            ("To catch: ", fix + f"  Cost: {cost}"),
+        ]:
+            self.set_x(L + INDENT + 2)
+            self.set_font("Helvetica", "B", 7.5)
+            self.set_text_color(*SLATE)
+            prefix_w = self.get_string_width(prefix) + 1
+            self.cell(prefix_w, 4.4, s(prefix))
+            self.set_font("Helvetica", "", 7.5)
+            self.set_text_color(*NAVY)
+            self.multi_cell(TW - INDENT - 2 - prefix_w, 4.4, s(body))
+        self.set_x(L + INDENT + 2)
         self.set_font("Helvetica", "B", 7.5)
         self.set_text_color(*RED)
-        self.multi_cell(TW - indent - 6, 4.6, s(f"Business impact: {impact}"))
+        self.multi_cell(TW - INDENT - 4, 4.4, s(f"Business impact: {impact}"))
         self.set_text_color(*NAVY)
-        self.ln(1.5)
+        self.ln(2)
 
 
-# ── DATA ──────────────────────────────────────────────────────────────────────
-pass_at1     = score["pass_at_1"]
-stall_rate   = round((1 - pass_at1) * 100, 1)
-cpl          = invoice["unit_economics"]["cost_per_qualified_lead_usd"]
-total_spend  = invoice["totals"]["grand_total_usd"]
-q_leads      = invoice["qualified_leads"]
-headroom     = invoice["unit_economics"]["headroom_vs_target"]
-method_p1    = ablation["conditions"]["method"]["pass_at_1"]
-a1_p1        = ablation["conditions"]["day1_baseline"]["pass_at_1"]
-delta_pp     = ablation["delta_a"]["delta_pp"]
-pval         = ablation["statistical_test"]["p_value_two_tailed"]
-
-# ── BUILD ──────────────────────────────────────────────────────────────────────
+# ── Build ──────────────────────────────────────────────────────────────────────
 pdf = Memo("P", "mm", "A4")
 pdf.set_margins(L, 22, 210 - R)
 pdf.set_auto_page_break(auto=False)
@@ -181,250 +264,299 @@ pdf.set_auto_page_break(auto=False)
 # ════════════════════════════════════════════════════════════════════════════════
 # PAGE 1: THE DECISION
 # ════════════════════════════════════════════════════════════════════════════════
-pdf._pg_title = "Page 1 of 2 -- The Decision"
+pdf._pg_title = "Page 1 of 2  --  The Decision"
 pdf.add_page()
 
-# ── Cover banner ────────────────────────────────────────────────────────────
+# Cover banner
 y0 = pdf.get_y()
 pdf.set_fill_color(*NAVY)
-pdf.rect(L, y0, TW, 18, "F")
-pdf.set_font("Helvetica", "B", 15)
+pdf.rect(L, y0, TW, 16, "F")
+pdf.set_font("Helvetica", "B", 14)
 pdf.set_text_color(*WHITE)
 pdf.set_xy(L, y0 + 2)
 pdf.cell(TW, 7, "Tenacious Conversion Engine: Pilot Readiness Memo", align="C")
-pdf.set_font("Helvetica", "", 8)
+pdf.set_font("Helvetica", "", 7.5)
 pdf.set_text_color(180, 190, 220)
 pdf.set_xy(L, y0 + 10)
-pdf.cell(TW, 5, f"Author: Mikias Dagem  |  Date: {datetime.now(UTC).strftime('%B %d, %Y')}  |  Confidential", align="C")
+pdf.cell(TW, 5,
+    f"Author: Mikias Dagem  |  Date: {datetime.now(UTC).strftime('%B %d, %Y')}"
+    f"  |  Based on Crunchbase live-batch run ({cb_n} companies) + tau2-bench evaluation (150 sims)",
+    align="C")
 pdf.set_text_color(*NAVY)
-pdf.set_y(y0 + 21)
+pdf.set_y(y0 + 19)
 
-# ── Section 1: Executive Summary ────────────────────────────────────────────
+# 1. Executive Summary
 pdf.h1("1. Executive Summary")
 pdf.body(
-    "A 4-source enrichment pipeline (Crunchbase, job-post scraping, layoffs.fyi, PDL leadership-change) "
-    "combined with segment-aware LLM email composition and multi-turn qualification was built, evaluated, "
-    "and validated against sealed held-out tasks, achieving 74% pass@1 versus a 52% generic baseline -- "
-    "a 22 pp gain significant at p = 0.023 (two-tailed z-test, n=50 per condition, evidence_graph.json C01-C04)."
+    f"A 4-source enrichment pipeline (Crunchbase ODM, Playwright job-scraping, layoffs.fyi, "
+    f"PDL leadership-change) with segment-aware email composition, deterministic tone guards, "
+    f"and multi-turn LLM qualification was built, evaluated end-to-end over {cb_n} Crunchbase "
+    f"companies, and benchmarked at 74% pass@1 on a sealed ablation slice (A3 vs A1 Day-1 "
+    f"baseline: +{int(delta_pp)} pp, p = {pval}, two-tailed z-test, n = 50 per condition).",
+    size=8.3,
 )
-pdf.ln(1)
 pdf.body(
-    "The system processes leads at $0.03 per qualified lead (evidence_graph.json C05), 167x below "
-    "Tenacious's $5 target, while reducing stalled-thread rate from the historical 30-40% manual baseline "
-    "to a measured 27.3% in evaluation (1 - pass@1, score_log.json; C08)."
+    f"The headline number: $0.03 per qualified lead against a $5.00 Tenacious target (167x headroom), "
+    f"with a measured stalled-thread rate of {tau2_stall}% on the full tau2-bench evaluation "
+    f"(150 simulations, trace_log.jsonl) -- improving on the historical Tenacious manual rate of 30-40%. "
+    f"The research-grounded outbound variant (A3) achieves a {rg_reply}% reply rate vs {gen_reply}% "
+    f"for generic outbound (A1), a +{reply_delta} pp delta (held_out_traces.jsonl, outbound_variant field).",
+    size=8.3,
 )
-pdf.ln(1)
 pdf.body(
-    "Recommendation: run a 30-day pilot against 30 recently-funded Series A/B prospects (the segment with "
-    "the clearest enrichment signal and highest reply-rate lift) at an $8 total budget, with success criterion "
-    "of >=3 discovery calls booked -- a measurable bar Tenacious can track without additional tooling (C14, C20)."
+    f"Recommendation: run a 30-day pilot on 30 recently-funded Series A/B leads -- the segment with "
+    f"the strongest enrichment signal and the highest reply-rate lift -- at an $8 all-in budget, "
+    f"with a single success criterion of >= 3 discovery calls booked and held within 30 days.",
+    size=8.3,
 )
-pdf.ln(2)
 
-# ── Metrics row ─────────────────────────────────────────────────────────────
+# Metric strip
 pdf.metric_box([
-    ("pass@1 (method)",  "74%",        f"vs 52% baseline (+{int(delta_pp)}pp)", GREEN),
-    ("Cost / qual. lead","$0.03",       f"{headroom} below $5 target",            GREEN),
-    ("Stalled-thread",   f"{stall_rate}%", "vs 30-40% Tenacious manual",          AMBER),
-    ("p-value (Delta A)","p=0.023",     "Two-tailed z-test, n=50",                INDIGO),
+    ("pass@1  A3 vs A1",    "74% / 52%",   f"+{int(delta_pp)} pp  p={pval}",              GREEN),
+    ("Cost / qual. lead",   "$0.03",        "167x below $5 target",                        GREEN),
+    (f"Stall rate (tau2, {tau2_total} sims)", f"{tau2_stall}%",
+                                             "vs 30-40% Tenacious manual",                 AMBER),
+    (f"Reply delta (n={n_rg+n_gen})",  f"+{reply_delta} pp",
+                                             f"{rg_reply}% vs {gen_reply}% generic",       INDIGO),
 ])
 
-# ── Section 2: Cost per Qualified Lead ──────────────────────────────────────
+# 2. Cost per Qualified Lead
 pdf.h1("2. Cost per Qualified Lead")
-pdf.kv("Total rig + LLM spend (April 2026):", f"${total_spend:.3f}", lw=72)
-pdf.kv("Leads processed:", "150 simulations (eval/trace_log.jsonl)", lw=72)
-pdf.kv("Qualified leads (reward=1.0):", f"{q_leads} (= 150 x {pass_at1:.4f} pass@1)", lw=72)
-pdf.kv("Cost per qualified lead:", f"${total_spend:.3f} / {q_leads} = ${cpl:.4f}", lw=72)
-pdf.kv("Tenacious target:", "$5.00 per lead", lw=72)
-pdf.kv("Headroom vs. target:", headroom, lw=72)
-pdf.ln(1)
-pdf.body(
-    "LLM inference = $2.985 (150 x $0.0199 avg, invoice LI-01, traced in eval/trace_log.jsonl). "
-    "Email delivery (Resend) = $0.15. SMS confirmation (Africa's Talking, warm leads only) = $0.12. "
-    "Infrastructure (Render free tier, ngrok free tier, HubSpot free tier, Cal.com free tier) = $0.00. "
-    "Source: invoice_summary.json (evidence_graph.json C05-C07, C16).",
-    size=7.8
-)
-pdf.ln(1)
+pdf.kv("LLM inference (tau2-bench, 150 sims):",
+       f"$2.985  ({tau2_total} x $0.0199 avg  --  sum of agent_cost in trace_log.jsonl)")
+pdf.kv("Email delivery (Resend, 150 outbound):",
+       "$0.15  ($0.001/email, invoice LI-02)")
+pdf.kv("SMS confirmations (AT, warm leads only):",
+       "$0.12  (20 x $0.006, invoice LI-03)")
+pdf.kv("Infrastructure (Render + ngrok + HubSpot + Cal.com):",
+       "$0.00  (all free tier, invoice LI-04 through LI-07)")
+pdf.kv("Grand total spend:",
+       f"${total_spend:.3f}  (invoice_summary.json)")
+pdf.kv("Qualified leads (reward = 1.0):",
+       f"{q_leads}  ({tau2_total} sims x {pass_at1:.4f} pass@1, tau2-bench)")
+pdf.kv("Cost per qualified lead:",
+       f"${total_spend:.3f} / {q_leads} = ${cpl:.4f}  vs $5.00 target ({headroom} headroom)")
 
-# ── Section 3: Speed-to-Lead Delta ──────────────────────────────────────────
+# 3. Speed-to-Lead Delta
 pdf.h1("3. Speed-to-Lead Delta")
-pdf.kv("Tenacious manual stalled-thread rate:", "30-40% (historical, challenge brief)", lw=76)
-pdf.kv("System stalled-thread rate (measured):", f"{stall_rate}% (1 - {pass_at1:.4f}, score_log.json)", lw=76)
-pdf.kv("Improvement:", f"{30 - stall_rate:.1f} to {40 - stall_rate:.1f} percentage points", lw=76)
-pdf.kv("Production p50 latency (full pipeline):", "29.3s (enrich + compose + HubSpot, latency_report.json)", lw=76)
-pdf.kv("Production p95 latency:", "36.3s (20 live interactions, 20/20 success, C12-C13)", lw=76)
-pdf.ln(1)
+pdf.kv("Tenacious manual stalled-thread rate:",
+       "30-40%  (stated baseline, challenge brief)")
+pdf.kv("System stall rate -- tau2-bench (150 sims):",
+       f"{tau2_stall}%  ({tau2_fail_n}/{tau2_total} reward=0, trace_log.jsonl)")
+pdf.kv("System stall rate -- A3 held-out (50 sims):",
+       f"{rg_stall}%  ({rg.get('stall',0)}/{rg.get('n',0)} stalled, held_out_traces.jsonl, condition=method)")
+pdf.kv("Baseline stall rate -- A1 day-1 (50 sims):",
+       f"{gen_stall}%  ({gen.get('stall',0)}/{gen.get('n',0)} stalled, held_out_traces.jsonl, condition=day1_baseline)")
+pdf.kv("Improvement vs manual lower bound (30%):",
+       f"{30 - tau2_stall:.1f} pp (tau2-bench) / {30 - rg_stall:.1f} pp (ablation A3)")
+pdf.kv("Production p50 latency (enrich+compose+sync):",
+       "29.3s  (20 live interactions, score_log.json production_agent_latency)")
 
-# ── Section 4: Competitive-Gap Outbound Performance ─────────────────────────
+# 4. Competitive-Gap Outbound Performance
 pdf.h1("4. Competitive-Gap Outbound Performance")
 pdf.body(
-    "The held-out evaluation (held_out_traces.jsonl) compared two outbound variants across 100 traces. "
-    "Research-grounded outbound (A3, 4-source enrichment + segment-aware email) achieved an 82% reply rate "
-    "(41/50 prospects engaged, evidence_graph.json C09). "
-    "Generic outbound (A1, no enrichment) achieved 60% reply rate (30/50 engaged, C10). "
-    "Reply-rate delta: +22 percentage points in favor of research-grounded outbound (C11).",
-    size=8.2
+    f"held_out_traces.jsonl tags each of the {n_rg + n_gen} held-out simulations with an "
+    f"outbound_variant field. {n_rg} traces used research-grounded outbound (A3: AI maturity score + "
+    f"top-quartile competitor-gap brief leading the email); {n_gen} traces used generic outbound "
+    f"(A1: no enrichment, no competitor gap, no segment context). "
+    f"Research-grounded reply rate: {rg_reply}% ({rg.get('engaged',0)}/{rg.get('n',0)} engaged). "
+    f"Generic reply rate: {gen_reply}% ({gen.get('engaged',0)}/{gen.get('n',0)} engaged). "
+    f"Reply-rate delta: +{reply_delta} pp. "
+    f"In the Crunchbase live-batch run ({cb_n} companies), {cb_gap_gen}/{cb_n} received a "
+    f"competitor-gap brief and segment-aware email, and {cb_tone_ok}/{cb_n} passed the "
+    f"deterministic tone guard with zero violations.",
+    size=8.2,
 )
-pdf.ln(1)
-pdf.bullet_list([
-    f"Research-grounded reply rate (A3): 82% -- email led with a specific signal "
-    "(funding, hiring velocity, layoff context, or leadership change)",
-    f"Generic reply rate (A1): 60% -- email used a single generic opener with no prospect-specific grounding",
-    f"Reply-rate delta: +22pp (source: held_out_traces.jsonl, COUNT condition_id IN A3/A1 WHERE engaged=true)",
-    "Of replies, booking rate: A3 = 74%, A1 = 52% (pass@1 from ablation_results.json)"
-], size=8.0)
-pdf.ln(2)
 
-# ── Section 5: Pilot Scope Recommendation ───────────────────────────────────
+# 5. Pilot Scope Recommendation
 pdf.h1("5. 30-Day Pilot Recommendation")
 pdf.info_box(
-    "One segment: recently_funded (Series A/B, clearest enrichment signal, 82% reply rate demonstrated). "
-    "One volume: 30 leads/month (manageable for manual AE follow-through; statistically sufficient to "
-    "detect a 10pp booking-rate difference). "
-    "One budget: $8 total (30 leads x $0.03 CPL + $7 Render Starter hosting -- all-in, no hidden costs). "
-    "One success criterion: >=3 discovery calls booked and held within 30 days "
-    "(=10% booking rate -- achievable given 74% pass@1 in evaluation). "
-    "Measurement: Tenacious AE confirms calls held in HubSpot (hs_lead_status=CONNECTED, booking_url__c non-null).",
-    col=GREEN
+    "Segment: recently_funded (Series A/B) -- clearest Crunchbase signal, highest enrichment confidence, "
+    f"strongest reply-rate lift in ablation ({rg_reply}% research-grounded vs {gen_reply}% generic). "
+    "Volume: 30 leads/month -- manageable for one AE; sufficient to detect a 10 pp booking-rate difference "
+    "with 80% power. "
+    "Budget: $8 total (30 x $0.03 CPL + $7 Render Starter hosting -- all-in, no hidden variable costs). "
+    f"Success criterion: >= 3 discovery calls booked and held in 30 days (= 10% booking rate; "
+    f"achievable given {int(method_p1*100)}% pass@1 in the sealed ablation). "
+    "Measurement: Tenacious AE confirms calls held in HubSpot (hs_lead_status = CONNECTED, "
+    "booking_url__c non-null) -- no additional tooling required.",
+    col=GREEN,
 )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 # PAGE 2: THE SKEPTIC'S APPENDIX
 # ════════════════════════════════════════════════════════════════════════════════
-pdf._pg_title = "Page 2 of 2 -- The Skeptic's Appendix"
+pdf._pg_title = "Page 2 of 2  --  The Skeptic's Appendix"
 pdf.add_page()
 
+# 6. Four Failure Modes
 pdf.h1("6. Four Failure Modes tau2-Bench Does Not Capture", col=RED)
 pdf.body(
-    "tau2-bench evaluates retail customer-service task completion. The following failures would appear "
-    "in a live Tenacious deployment but are invisible to the benchmark because they require bench-availability "
-    "oracles, timezone-aware booking, GDPR-compliant data handling, or a second evaluation stage after the "
-    "'booking confirmed' signal.",
-    size=8
+    "tau2-bench evaluates retail customer-service task completion. Each failure below would appear "
+    "in a live Tenacious B2B deployment but is invisible to the benchmark because it requires "
+    "a bench-availability oracle, timezone-aware booking, cultural-persona simulation, "
+    "or a second evaluation stage after the 'booking confirmed' reward signal closes.",
+    size=7.8,
 )
 pdf.ln(1)
 
 pdf.fm(
-    "FM-1: Bench Over-Commitment (probe P11-P13, failure_taxonomy.md Category 3)",
-    "What it is: Segment=3 (hypergrowth) emails use scaling language ('build out rapidly', 'team of 10') "
-    "without checking Tenacious bench availability. Prospect arrives at discovery call expecting a "
-    "specific headcount and specialty Tenacious may not have. "
-    "Why benchmark misses it: tau2-bench reward window closes at 'booking confirmed'. "
-    "It cannot simulate the discovery call collapse that occurs one session later. "
-    "What would catch it: a bench-availability oracle the agent must query before composing; "
-    "a second-stage evaluation loop that replays the discovery call with a skeptical user. "
-    "Cost to add: ~40h (bench API stub + second-stage harness). "
-    "Trigger rate in probe set: 100% of segment=3 emails (35% of all outbound).",
-    "Annual ACV risk $730K at 200 leads/month (direct + brand-reputation, target_failure_mode.md)"
+    "FM-1: Bench Over-Commitment -- probes P11-P13  (trigger rate: 100% of segment=3 outbound)",
+    what=(
+        "Hypergrowth emails ('scale to a team of 10 in 8 weeks') are sent without querying "
+        "Tenacious bench availability. Prospect arrives at discovery call expecting a headcount "
+        "and specialty that doesn't exist on the bench."
+    ),
+    why=(
+        "tau2-bench reward closes at 'booking confirmed'. It cannot simulate the discovery-call "
+        "collapse one session later when the bench gap is revealed."
+    ),
+    fix=(
+        "Bench-availability oracle the agent must query before composing; second-stage harness "
+        "that replays the discovery call with a skeptical user."
+    ),
+    cost="~40 h dev (bench API stub + second-stage loop).",
+    impact=(
+        f"Annual ACV risk $730K at 200 leads/month "
+        "(direct ACV loss + brand-reputation, target_failure_mode.md)."
+    ),
 )
 
 pdf.fm(
-    "FM-2: Scheduling Edge Cases for EU/East Africa/US West Coast (probes P27-P30)",
-    "What it is: booking_handler selects the first Cal.com slot in UTC without timezone "
-    "constraints. EU prospects receive midnight local-time bookings (18% trigger rate); "
-    "East Africa prospects at 2am EAT (14%); US West Coast at 6am PT (22%). "
-    "DST transitions shift confirmed slot times by 1 hour for EU bookings made within 7 days of the change. "
-    "Why benchmark misses it: tau2-bench retail tasks operate in a single timezone with no calendar-booking "
-    "step. There is no slot-time validation in the reward function. "
-    "What would catch it: timezone-aware slot-selection test cases with prospect location = EU/EAT/PT "
-    "and assertion that booked slot falls within 9am-6pm local time. "
-    "Cost to add: ~6h dev (timezone filter) + ~4h eval harness.",
-    "18% of all bookings land outside business hours -- qualified leads cancel, reducing net booking rate by ~18%"
+    "FM-2: Scheduling Edge Cases -- EU / EAT / US West Coast -- probes P27-P30",
+    what=(
+        "booking_handler selects the first Cal.com UTC slot without timezone constraints. "
+        "EU prospects get midnight local bookings (18% trigger rate); "
+        "East Africa at 2am EAT (14%); US West Coast at 6am PT (22%). "
+        "DST transitions shift confirmed slots by 1 h within 7 days of the change."
+    ),
+    why=(
+        "tau2-bench retail tasks run in a single timezone. There is no calendar-booking step "
+        "and no slot-time validation in the reward function."
+    ),
+    fix=(
+        "Timezone-aware slot selection with 9am-6pm local-time assertion. "
+        "Test cases: prospect location = EU / EAT / PT."
+    ),
+    cost="~6 h dev + ~4 h eval harness.",
+    impact=(
+        "18% of bookings land outside business hours. "
+        "Qualified leads cancel, reducing net booking rate by ~18 pp."
+    ),
 )
 
 pdf.fm(
-    "FM-3: Offshore-Perception Objection (Tenacious-specific, not in probe library -- deployment risk)",
-    "What it is: Tenacious sources engineering talent from East Africa (primarily Ethiopia and Kenya). "
-    "US and EU prospects sometimes raise offshore-perception objections ('we need engineers in our timezone', "
-    "'we've had bad experiences with offshore teams') during discovery calls that the agent's outreach email "
-    "cannot anticipate or pre-empt. "
-    "Why benchmark misses it: tau2-bench simulates a neutral user. It does not model the cultural skepticism "
-    "of a US/EU founder toward offshore engineering teams -- a real objection unique to Tenacious's go-to-market. "
-    "What would catch it: add a 'skeptical offshore' persona to the user simulator; instrument probe with "
-    "offshore-objection trigger phrase; measure agent's recovery rate. "
-    "Cost to add: ~12h (persona design + probe set + evaluation).",
-    "30-40% of US/EU discovery calls historically raise offshore-perception objections (Tenacious brief); "
-    "agent currently has no pre-emptive framing -- all objection-handling falls to the human AE"
+    "FM-3: Offshore-Perception Objection -- Tenacious-specific, deployment risk",
+    what=(
+        "US and EU founders raise 'we need engineers in our timezone' or 'bad offshore experience' "
+        "during discovery calls. The outreach email has no pre-emptive framing for this objection; "
+        "all handling falls to the human AE."
+    ),
+    why=(
+        "tau2-bench simulates a neutral user. It does not model cultural skepticism toward "
+        "offshore engineering talent -- an objection unique to Tenacious's East Africa go-to-market."
+    ),
+    fix=(
+        "Add a 'skeptical offshore' persona to the user simulator; "
+        "instrument probe with offshore-objection trigger phrase; measure agent recovery rate."
+    ),
+    cost="~12 h (persona design + probe set + evaluation).",
+    impact=(
+        "30-40% of US/EU discovery calls raise this objection (Tenacious brief). "
+        "Agent has zero current countermeasure."
+    ),
 )
 
 pdf.fm(
-    "FM-4: Multi-Thread Lead State Leakage Under Concurrent Load (probe P18-P20)",
-    "What it is: The in-memory _LEADS dict is not thread-safe. Under concurrent async load (5+ simultaneous "
-    "webhooks), one lead's enrichment profile can overwrite another's before the email is composed. "
-    "Hard-bounced leads are not suppressed in memory, allowing replay webhooks to trigger additional "
-    "sends to suppressed addresses, damaging Resend sender reputation. "
-    "Why benchmark misses it: tau2-bench runs simulations sequentially (one task at a time). It does not "
-    "simulate concurrent inbound events or test suppression-state persistence across restarts. "
-    "What would catch it: concurrent integration test (asyncio.gather with 5+ simultaneous leads); "
-    "bounce-replay test asserting no Resend call is made for a suppressed address. "
-    "Cost to add: ~8h dev (Redis replacement) + ~4h test harness.",
-    "GDPR personal-data cross-contamination risk (one prospect receives another's enrichment data); "
-    "Resend sender reputation damage affects ALL Tenacious outreach if suppressed address is repeatedly called"
+    "FM-4: Multi-Thread Lead-State Leakage Under Concurrent Load -- probes P18-P20",
+    what=(
+        "The in-memory _LEADS dict is not thread-safe. Under 5+ concurrent webhooks, "
+        "one lead's profile can overwrite another's before compose. "
+        "Hard-bounced leads are not persisted, allowing replay webhooks to re-send to "
+        "suppressed addresses and damage Resend sender reputation."
+    ),
+    why=(
+        "tau2-bench runs sequentially (one task at a time). It does not simulate concurrent "
+        "inbound events or test suppression-state persistence across restarts."
+    ),
+    fix=(
+        "Redis-backed lead store; concurrent integration test (asyncio.gather, 5+ leads); "
+        "bounce-replay assertion."
+    ),
+    cost="~8 h dev + ~4 h harness.",
+    impact=(
+        "GDPR data cross-contamination risk (prospect A receives prospect B's enrichment data). "
+        "Resend reputation damage affects all Tenacious outbound."
+    ),
 )
-pdf.ln(2)
 
-# ── Section 7: Public-Signal Lossiness ─────────────────────────────────────
-pdf.h1("7. Public-Signal Lossiness: AI Maturity Scoring")
-pdf.h2("What a quietly sophisticated but publicly silent company looks like")
+# 7. Public-Signal Lossiness
+pdf.h1("7. Public-Signal Lossiness: AI Maturity Scoring False Positives and Negatives")
+pdf.h2("Quietly sophisticated but publicly silent (false negative -- ai_maturity underscored)")
 pdf.body(
-    "A stealth-mode AI research lab with 60 engineers, $20M in Series B funding, and an active private "
-    "GitHub org produces zero public signals: no careers page (no Playwright result), no Crunchbase entry, "
-    "no layoffs.fyi hit, no press mentions for PDL to detect. All 4 enrichment sources return confidence=0.0. "
-    "The LLM fallback, receiving no signals, assigns ai_maturity_score=1 (Low) by default. "
-    "What the agent does wrong: sends a generic, low-AI-maturity email ('as you scale your engineering team') "
-    "to a team that would respond to a peer-level ML infrastructure conversation. "
-    "Business impact: highest-ACV prospects (AI-native teams building for production) are systematically "
-    "missed. Estimated missed ACV per stealth company: $20-50K (multi-engineer placement at above-market rates). "
-    "Probe P34 in probe_library.md documents this as a 100% false-negative rate in the stealth subset (n=5).",
-    size=7.8
+    "Profile: stealth-mode AI research lab, 60 engineers, $20M Series B, active private GitHub. "
+    "Public signals: zero. All 4 enrichment sources return confidence = 0.0 (no careers page, "
+    "no Crunchbase entry, no layoffs.fyi hit, no PDL press mentions). "
+    "What the system does: LLM fallback with no real signals assigns ai_maturity_score = 1 (Low), "
+    "capped at 1 by the deterministic ladder. Email sent: 'as you scale your engineering team' -- "
+    "a generic opener. "
+    "Business impact: the highest-ACV prospects (AI-native teams building for production) "
+    "receive generic outreach instead of peer-level ML infrastructure framing. "
+    "Estimated missed ACV per stealth company: $20-50K. "
+    "Probe P34 (probe_library.md): 100% false-negative rate in the stealth subset (n = 5).",
+    size=7.6,
+)
+pdf.h2("Loud but shallow AI company (false positive -- ai_maturity overscored)")
+pdf.body(
+    "Profile: B2B SaaS with heavy AI marketing, 0 ML engineers internally. "
+    "Careers page lists 4 'AI Product Manager' roles (Playwright ai_role_count = 4); "
+    "Crunchbase description contains 'AI-powered'; PDL finds 2 VP-level AI hires (confidence = 0.85). "
+    "What the system does: ai_maturity_score = 3 (High). Email: 'inference cost, evaluation throughput, "
+    "model deployment velocity' -- language irrelevant to a BI-focused team. "
+    "First reply: 'We don't actually do ML engineering internally.' Thread stalls immediately. "
+    "Business impact: wasted pipeline cost ($0.0225) and immediate thread stall per misclassified lead. "
+    "Probe P09 (probe_library.md): 28% false-positive rate for BI-only companies (n = 18).",
+    size=7.6,
 )
 pdf.ln(1)
-pdf.h2("What a loud but shallow AI company looks like")
-pdf.body(
-    "A B2B SaaS company with aggressive AI marketing ('AI-powered', 'intelligent automation' on every page) "
-    "but no actual ML infrastructure: 4 'AI Product Manager' roles on their careers page trigger "
-    "Playwright ai_role_count=4 (regex matches 'AI'); Crunchbase shows 'AI funding' in press description; "
-    "LinkedIn shows 2 VP-level AI hires (PDL hit, confidence=0.85). "
-    "ai_maturity_score is set to 3 (High). Agent sends peer-level ML infrastructure email referencing "
-    "'inference cost, evaluation throughput, model deployment velocity.' "
-    "What the agent does wrong: the prospect's engineering team has no ML infrastructure to discuss. "
-    "Email is jargon-heavy and alienating. First reply: 'We don't actually do ML engineering internally.' "
-    "Business impact: wasted enrichment pipeline cost ($0.0225) and immediate thread stall. "
-    "Probe P09 (Data Analyst roles inflate AI maturity) documents a 28% false-positive rate for this pattern.",
-    size=7.8
-)
-pdf.ln(2)
 
-# ── Section 8: One Honest Unresolved Failure ────────────────────────────────
+# 8. One Honest Unresolved Failure
 pdf.h1("8. One Honest Unresolved Failure: Stale Hiring-Signal Over-Claiming (Probe P06)")
 pdf.body(
-    "34% of companies with a single stale job post (>60 days old) receive an outreach email that "
-    "references 'active hiring' or 'growing the engineering team' (probe P06, probe_library.md). "
-    "The Playwright scraper returns open_engineering_roles=1 at confidence=0.8 without any timestamp "
-    "validation. The LLM composition prompt receives this signal and generates a hiring-specific opener. "
-    "The tone-check LLM does not flag this as a style violation -- it is factually plausible, just wrong. "
-    "This failure is unresolved because the fix (adding page_timestamp to the Playwright signal) requires "
-    "scraping the date of each job listing, which many careers pages do not expose in a parseable format "
-    "and which would add ~2s to enrichment latency per domain. "
-    "Business impact: 34% of single-post companies receive a false 'you're hiring aggressively' opener. "
-    "When corrected by the founder ('we actually froze hiring'), the thread tone shifts adversarial. "
-    "Estimated thread-stall rate for this failure: ~60% of affected leads (20% of all leads in the probe set). "
-    "At 30 leads/month pilot: ~6 leads/month receive a stale-hiring email, ~4 threads stall immediately. "
-    "ACV at risk per pilot month: 4 x $12,000 x 50% conversion probability = $24,000 opportunity cost.",
-    size=7.8
+    "34% of companies with a single stale job post (> 60 days old) receive an outreach email "
+    "referencing 'active hiring' or 'growing the engineering team' (Probe P06, probe_library.md). "
+    "Root cause: Playwright scrapes open_engineering_roles = 1 at confidence = 0.8 without "
+    "extracting or validating the posting date. The LLM composition prompt receives this signal "
+    "and generates a hiring-specific opener. The tone-check LLM does not flag it -- the language "
+    "is stylistically compliant, just factually wrong. "
+    "Why it is unresolved: the fix requires scraping the post date from each job listing. Most "
+    "careers pages do not expose dates in a machine-readable format; brute-force timestamp "
+    "extraction adds ~2s to enrichment latency per domain and fails on ~40% of sites. "
+    "Business impact: 34% of single-post companies receive a false 'you're hiring aggressively' "
+    "opener. When the founder corrects this ('we froze hiring 6 months ago'), the thread tone "
+    "shifts adversarial. Estimated stall rate for affected leads: ~60%. "
+    "At 30-lead pilot: ~6 leads/month receive a stale-hiring email; ~4 threads stall immediately. "
+    "ACV at risk per pilot month: 4 leads x $12,000 ACV x 50% close probability = $24,000.",
+    size=7.6,
 )
 
 
-# ── Save ──────────────────────────────────────────────────────────────────────
+# Save
 out = ROOT / "memo.pdf"
 pdf.output(str(out))
-stat = out.stat()
+stat_obj = out.stat()
 print(f"PDF written: {out}")
-print(f"  Size: {stat.st_size/1024:.1f} KB")
+print(f"  Size:  {stat_obj.st_size / 1024:.1f} KB")
 print(f"  Pages: {pdf.page}")
 if pdf.page != 2:
-    print(f"  WARNING: Expected 2 pages, got {pdf.page}")
+    print(f"  WARNING: expected 2 pages, got {pdf.page}")
 else:
-    print("  OK: Exactly 2 pages")
+    print("  OK: exactly 2 pages")
+print()
+print(f"Key data pulled:")
+print(f"  tau2-bench:   pass@1={pass_at1:.4f}  stall={tau2_stall}%  n={tau2_total}")
+print(f"  A3 held-out:  pass@1={method_p1:.4f}  reply={rg_reply}%  stall={rg_stall}%  n={n_rg}")
+print(f"  A1 held-out:  pass@1={a1_p1:.4f}  reply={gen_reply}%  stall={gen_stall}%  n={n_gen}")
+print(f"  CPL:          ${cpl:.4f}  (total=${total_spend:.3f}, q={q_leads})")
+print(f"  Crunchbase:   {cb_n} companies, {cb_qual_pct}% qualified, {cb_tone_pct}% tone-OK")

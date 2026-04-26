@@ -23,7 +23,7 @@ _HEADERS = {
 
 def _contact_id_by_email(email: str) -> str | None:
     try:
-        resp = httpx.get(
+        resp = httpx.post(
             f"{_BASE}/crm/v3/objects/contacts/search",
             headers=_HEADERS,
             json={
@@ -63,10 +63,12 @@ def upsert_contact(
         "lastname": last_name,
         "company": company,
         "hs_lead_status": "IN_PROGRESS",
-        "segment__c": segment_label,                      # custom property
-        "ai_maturity_score__c": str(ai_maturity_score),  # custom property
-        "booking_url__c": booking_url,                    # custom property
-        "enrichment_timestamp__c": enrichment_ts,         # custom property
+        "message": (
+            f"segment={segment_label} | "
+            f"ai_maturity={ai_maturity_score} | "
+            f"enriched={enrichment_ts} | "
+            f"booking={booking_url}"
+        ),
     }
 
     existing_id = _contact_id_by_email(email)

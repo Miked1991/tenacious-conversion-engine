@@ -335,3 +335,44 @@ async def simulate_sms(request: Request):
         reply_pipeline_fn=lambda _p, _t: _run_reply_pipeline(warm_lead.email, _t),
     )
     return JSONResponse(result)
+
+
+if __name__ == "__main__":
+    import argparse
+    from agent.enrichment_pipeline import get_company_contacts
+    
+    parser = argparse.ArgumentParser(description='Run conversion engine pipeline')
+    parser.add_argument('--live_mode', action='store_true', help='Run with real email/booking APIs')
+    parser.add_argument('--company_id', help='Crunchbase company ID (format: crunchbase:company-name)')
+    parser.add_argument('email', nargs='?', help='Optional direct email target')
+    args = parser.parse_args()
+    
+    if args.company_id:
+        if not args.company_id.startswith('crunchbase:'):
+            print("Error: Company ID must start with 'crunchbase:'")
+            exit(1)
+            
+        company_name = args.company_id.split(':', 1)[1]
+        contacts = get_company_contacts(company_name)
+        if not contacts:
+            print(f"No contacts found for {company_name}")
+            exit(1)
+            
+        primary_email = next((c['email'] for c in contacts if c.get('email')), None)
+        if not primary_email:
+            print(f"No email found for {company_name}")
+            exit(1)
+            
+        target_email = primary_email
+    elif args.email:
+        target_email = args.email
+    else:
+        print("Error: Must provide either --company_id or email")
+        exit(1)
+    
+    if args.live_mode:
+        print(f"Running LIVE pipeline for {target_email}")
+        result = _run_full_pipeline(target_email, "Manual run triggered via CLI")
+        print(f"Pipeline completed: {result}")
+    else:
+        print(f"Running in test mode for {target_email} (no actual emails/bookings will be sent)")

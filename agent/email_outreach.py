@@ -25,9 +25,9 @@ from agent.langfuse_logger import log_span
 load_dotenv()
 
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
-_DEV_MODEL = os.getenv("DEV_MODEL", "qwen/qwen3.5-35b-a3b")
+_DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 _RESEND_KEY = os.getenv("RESEND_API_KEY", "")
-_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
+_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")  # Using Resend's default domain
 _MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() in ("1", "true", "yes")
 
 # Segment-aware mock email templates used when MOCK_LLM=true
@@ -149,7 +149,20 @@ def _llm(messages: list, max_tokens: int = 400) -> str:
             timeout=40,
         )
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        # Strip in-band thinking tokens (Qwen3 / o-series style)
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if not content:
+            # Fall back to reasoning field if content is empty after stripping
+            content = (msg.get("reasoning") or "").strip()
+        if not content:
+            raise RuntimeError(
+                f"LLM returned empty content. Full response: {data}"
+            )
+        return content
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"LLM call failed ({_DEV_MODEL}): {exc}") from exc
 

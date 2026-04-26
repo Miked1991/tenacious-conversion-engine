@@ -1,0 +1,166 @@
+{
+  "run_id": "72563c7c",
+  "trace_id": "3480f6cf-31c1-4a42-b77c-951fde53b0ec",
+  "processed_at": "2026-04-25T19:38:32Z",
+  "input": {
+    "name": "Wiring Technologies",
+    "domain": "wiringtech.com",
+    "website": "https://wiringtech.com/",
+    "contact_email": "eng.wiringtechno@wiringtech.com",
+    "is_synthetic_email": true,
+    "num_employees": "51-100",
+    "country_code": "US",
+    "industries": "[{\"id\":\"telecommunications\",\"value\":\"Telecommunications\"}]",
+    "operating_status": "active",
+    "cb_rank": "620046"
+  },
+  "enrichment": {
+    "company_name": "Wiringtech",
+    "domain": "wiringtech.com",
+    "headcount": 150,
+    "funding_stage": "Series A",
+    "recently_funded": false,
+    "had_layoffs": false,
+    "headcount_growth_pct": 12.0,
+    "open_engineering_roles": 5,
+    "enriched_at": "2026-04-25T19:36:52Z",
+    "crunchbase_signal": {
+      "value": {
+        "note": "no CRUNCHBASE_API_KEY configured"
+      },
+      "confidence": 0.0,
+      "source": "crunchbase_odm_skipped",
+      "fetched_at": "2026-04-25T19:36:43Z"
+    },
+    "job_posts_signal": {
+      "value": {
+        "note": "playwright not installed; run: pip install playwright && playwright install chromium"
+      },
+      "confidence": 0.0,
+      "source": "playwright_jobs_skipped",
+      "fetched_at": "2026-04-25T19:36:43Z"
+    },
+    "layoffs_signal": {
+      "value": {
+        "note": "layoffs.fyi HTTP 404"
+      },
+      "confidence": 0.0,
+      "source": "layoffs_fyi_csv_error",
+      "fetched_at": "2026-04-25T19:36:47Z"
+    },
+    "leadership_change_signal": {
+      "value": {
+        "note": "no PDL_API_KEY configured; set PDL_API_KEY for live leadership-change detection"
+      },
+      "confidence": 0.0,
+      "source": "pdl_leadership_skipped",
+      "fetched_at": "2026-04-25T19:36:47Z"
+    },
+    "leadership_change": {
+      "detected": false,
+      "changed_role": "",
+      "change_type": "",
+      "change_date": "",
+      "previous_company": "",
+      "days_since_change": 0,
+      "outreach_urgency_boost": 0.0
+    }
+  },
+  "ai_maturity": {
+    "score": 1,
+    "label": "Low",
+    "reason": "LLM estimate=2 (no real signals; floor capped at 1)"
+  },
+  "segment": {
+    "id": 0,
+    "label": "generic"
+  },
+  "email": {
+    "subject": "One question about your engineering challenges",
+    "body": "Quick question: what's the biggest friction point in your engineering team today \u2014 hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
+    "tone_check": true,
+    "det_ok": true,
+    "violations": [],
+    "dry_send": true,
+    "send_result": {
+      "id": "dry-run-3480f6cf-31c1-4a42-b77c-951fde53b0ec",
+      "dry_run": true,
+      "subject": "One question about your engineering challenges",
+      "body": "Quick question: what's the biggest friction point in your engineering team today \u2014 hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
+      "to": "eng.wiringtechno@wiringtech.com"
+    }
+  },
+  "competitor_gap_brief": {
+    "prospect": "Wiringtech",
+    "domain": "wiringtech.com",
+    "segment": "generic",
+    "ai_maturity_score": 1,
+    "competitors": [
+      {
+        "name": "Toptal",
+        "positioning": "Premium global freelance network, claims top 3% of talent",
+        "gap": "High cost ($150\u2013200/hr) and 2\u20134 week vetting delay; no East Africa presence",
+        "tenacious_advantage": "40\u201360% lower cost with equivalent senior quality and 2\u20133 week placement vs Toptal's 4-week vetting"
+      },
+      {
+        "name": "Andela",
+        "positioning": "Africa-based engineering talent marketplace",
+        "gap": "Batch / marketplace model \u2014 prospect must self-manage engineers; limited ML/AI specialization depth",
+        "tenacious_advantage": "Specialist matching for ML/data roles with individual vetting and a Tenacious delivery lead who manages the engagement"
+      },
+      {
+        "name": "Upwork Enterprise",
+        "positioning": "Freelance marketplace with enterprise compliance layer",
+        "gap": "Unmanaged \u2014 prospect vets, manages, and retains contractors themselves; high coordination overhead at engineering-team scale",
+        "tenacious_advantage": "Fully managed model: Tenacious handles vetting, onboarding, and daily management so the engineering team lead can focus on product"
+      }
+    ],
+    "recommended_angle": "Cost-effective senior engineering capacity for Wiringtech without the management overhead of a freelance marketplace",
+    "top_gap_summary": "No competitor offers Wiringtech the combination of East Africa specialist talent at 40\u201360% cost reduction with a managed delivery model. Tenacious's 2\u20133 week placement process is the fastest path to qualified generic-stage engineers.",
+    "generated_at": "2026-04-25T19:37:06Z"
+  },
+  "hubspot": {
+    "contact_id": "",
+    "fields": {
+      "segment__c": "generic",
+      "ai_maturity_score__c": "1",
+      "booking_url__c": "",
+      "enrichment_timestamp__c": "2026-04-25T19:36:52Z"
+    }
+  },
+  "conversation": {
+    "reply_turns": [
+      {
+        "turn": 1,
+        "text": "Interesting \u2014 could you tell me more about the types of engineers you place?",
+        "qualified": false
+      },
+      {
+        "turn": 2,
+        "text": "What does the onboarding look like for a new engineer on our team?",
+        "qualified": false
+      },
+      {
+        "turn": 3,
+        "text": "We're actively looking to hire two backend engineers. Can we set up a quick call?",
+        "qualified": true
+      }
+    ],
+    "qualified": true
+  },
+  "booking": {
+    "success": false,
+    "booking_url": "",
+    "slot": "",
+    "error": "event type not found"
+  },
+  "ablation_comparison": {
+    "tau2_bench_baseline_pass_at_1": 0.7267,
+    "ablation_method_pass_at_1": 0.74,
+    "ablation_baseline_pass_at_1": 0.52,
+    "delta_a_pp": 22.0,
+    "expected_reply_rate_research_grounded": 0.68,
+    "expected_reply_rate_generic": 0.52,
+    "note": "This generic-segment company falls into the outbound variant that achieved 68% reply rate (research-grounded) vs 52% (generic) in the held-out ablation."
+  }
+}

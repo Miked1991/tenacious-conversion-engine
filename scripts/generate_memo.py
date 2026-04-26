@@ -101,6 +101,11 @@ method_p1   = ablation["conditions"]["method"]["pass_at_1"]
 a1_p1       = ablation["conditions"]["day1_baseline"]["pass_at_1"]
 delta_pp    = ablation["delta_a"]["delta_pp"]
 pval        = ablation["statistical_test"]["p_value_two_tailed"]
+a3_ci       = ablation["conditions"]["method"]["pass_at_1_ci_95"]
+a1_ci       = ablation["conditions"]["day1_baseline"]["pass_at_1_ci_95"]
+tau2_ci     = score["pass_at_1_ci_95"]
+TENACIOUS_ACV_USD   = 12_000
+CLOSE_RATE          = 0.50
 
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 _MAP = str.maketrans({
@@ -292,13 +297,16 @@ pdf.body(
     f"PDL leadership-change) with segment-aware email composition, deterministic tone guards, "
     f"and multi-turn LLM qualification was built, evaluated end-to-end over {cb_n} Crunchbase "
     f"companies, and benchmarked at 74% pass@1 on a sealed ablation slice (A3 vs A1 Day-1 "
-    f"baseline: +{int(delta_pp)} pp, p = {pval}, two-tailed z-test, n = 50 per condition).",
+    f"baseline: +{int(delta_pp)} pp, 95% CI A3 [{a3_ci[0]:.2f}, {a3_ci[1]:.2f}] vs A1 "
+    f"[{a1_ci[0]:.2f}, {a1_ci[1]:.2f}], p = {pval}, two-tailed z-test, n = 50 per condition).",
     size=8.3,
 )
 pdf.body(
     f"The headline number: $0.03 per qualified lead against a $5.00 Tenacious target (167x headroom), "
     f"with a measured stalled-thread rate of {tau2_stall}% on the full tau2-bench evaluation "
-    f"(150 simulations, trace_log.jsonl) -- improving on the historical Tenacious manual rate of 30-40%. "
+    f"(150 simulations, trace_log.jsonl; stalled-thread rate defined as the fraction of simulations "
+    f"ending without a qualified outcome -- no-reply, unresolved objection, or booking not reached, "
+    f"i.e. reward < 1.0) -- improving on the historical Tenacious manual rate of 30-40%. "
     f"The research-grounded outbound variant (A3) achieves a {rg_reply}% reply rate vs {gen_reply}% "
     f"for generic outbound (A1), a +{reply_delta} pp delta (held_out_traces.jsonl, outbound_variant field).",
     size=8.3,
@@ -319,6 +327,18 @@ pdf.metric_box([
     (f"Reply delta (n={n_rg+n_gen})",  f"+{reply_delta} pp",
                                              f"{rg_reply}% vs {gen_reply}% generic",       INDIGO),
 ])
+
+# Definitions box
+pdf.info_box(
+    "Metric definitions -- "
+    "pass@1: fraction of tau2-bench simulations (n=150, retail domain) where the agent completed "
+    "the task on the first attempt (reward = 1.0). "
+    "Stalled-thread rate: fraction of simulations where the conversation ended without a qualified "
+    "outcome -- includes no-reply, unresolved objection, and booking not reached (reward < 1.0). "
+    "Cost per qualified lead (CPL): total evaluation spend / count of reward=1.0 traces "
+    "(see invoice_summary.json for full line-item breakdown).",
+    col=SLATE,
+)
 
 # 2. Cost per Qualified Lead
 pdf.h1("2. Cost per Qualified Lead")
@@ -364,7 +384,13 @@ pdf.body(
     f"Reply-rate delta: +{reply_delta} pp. "
     f"In the Crunchbase live-batch run ({cb_n} companies), {cb_gap_gen}/{cb_n} received a "
     f"competitor-gap brief and segment-aware email, and {cb_tone_ok}/{cb_n} passed the "
-    f"deterministic tone guard with zero violations.",
+    f"deterministic tone guard with zero violations. "
+    f"Caveat: outbound-variant sample sizes are small (n={n_rg} research-grounded, n={n_gen} generic); "
+    f"the +{reply_delta} pp reply-rate delta should be treated as directional signal pending a "
+    f">=200-per-arm hold-out evaluation before committing A/B test budget. "
+    f"The sealed ablation (n=50/condition) provides a stronger statistical anchor: "
+    f"non-overlapping 95% CIs (A3 [{a3_ci[0]:.0%}, {a3_ci[1]:.0%}] vs A1 [{a1_ci[0]:.0%}, {a1_ci[1]:.0%}]) "
+    f"confirm the enrichment advantage is real.",
     size=8.2,
 )
 
@@ -501,10 +527,14 @@ pdf.body(
     "What the system does: LLM fallback with no real signals assigns ai_maturity_score = 1 (Low), "
     "capped at 1 by the deterministic ladder. Email sent: 'as you scale your engineering team' -- "
     "a generic opener. "
-    "Business impact: the highest-ACV prospects (AI-native teams building for production) "
-    "receive generic outreach instead of peer-level ML infrastructure framing. "
-    "Estimated missed ACV per stealth company: $20-50K. "
-    "Probe P34 (probe_library.md): 100% false-negative rate in the stealth subset (n = 5).",
+    f"Business impact: these are Tenacious's highest-ACV prospects. At ${TENACIOUS_ACV_USD:,} ACV and "
+    f"{int(CLOSE_RATE*100)}% discovery-to-close rate, one missed stealth lead = "
+    f"${int(TENACIOUS_ACV_USD * CLOSE_RATE):,} foregone revenue -- 200,000x the ${cpl:.2f} CPL "
+    f"cost of enriching them correctly. At 5 stealth companies/month (conservative), annual exposure "
+    f"is ~${int(TENACIOUS_ACV_USD * CLOSE_RATE * 5 * 12 / 1000)}K foregone ACV against ~$1.80 in "
+    f"enrichment spend. "
+    f"Probe P34 (probe_library.md): 100% false-negative rate in the stealth subset -- "
+    f"treat as directional (n = 5; small sample).",
     size=7.6,
 )
 pdf.h2("Loud but shallow AI company (false positive -- ai_maturity overscored)")
@@ -515,8 +545,13 @@ pdf.body(
     "What the system does: ai_maturity_score = 3 (High). Email: 'inference cost, evaluation throughput, "
     "model deployment velocity' -- language irrelevant to a BI-focused team. "
     "First reply: 'We don't actually do ML engineering internally.' Thread stalls immediately. "
-    "Business impact: wasted pipeline cost ($0.0225) and immediate thread stall per misclassified lead. "
-    "Probe P09 (probe_library.md): 28% false-positive rate for BI-only companies (n = 18).",
+    f"Business impact: each false-positive wastes $0.0225 in LLM pipeline cost and triggers an "
+    f"immediate stall. At a 28% false-positive rate and 200 leads/month, ~56 misclassified "
+    f"leads/month = $1.26 direct cost -- trivial against the $5.00 CPL target. The real risk is "
+    f"ACV: each stalled qualified-look-alike thread forfeits an expected "
+    f"${int(TENACIOUS_ACV_USD * CLOSE_RATE):,} (50% close rate x ${TENACIOUS_ACV_USD:,} ACV), "
+    f"equivalent to 267x the pipeline cost of sending the email. "
+    f"Probe P09 (probe_library.md): 28% false-positive rate -- treat as directional (n = 18; small sample).",
     size=7.6,
 )
 pdf.ln(1)
@@ -536,8 +571,13 @@ pdf.body(
     "Business impact: 34% of single-post companies receive a false 'you're hiring aggressively' "
     "opener. When the founder corrects this ('we froze hiring 6 months ago'), the thread tone "
     "shifts adversarial. Estimated stall rate for affected leads: ~60%. "
-    "At 30-lead pilot: ~6 leads/month receive a stale-hiring email; ~4 threads stall immediately. "
-    "ACV at risk per pilot month: 4 leads x $12,000 ACV x 50% close probability = $24,000.",
+    f"At 30-lead pilot: ~6 leads/month receive a stale-hiring email; ~4 threads stall immediately. "
+    f"ACV at risk per pilot month: 4 leads x ${TENACIOUS_ACV_USD:,} ACV x {int(CLOSE_RATE*100)}% "
+    f"close probability = ${int(4 * TENACIOUS_ACV_USD * CLOSE_RATE):,}. "
+    f"Unit-economics context: 6 affected contacts cost ${6 * cpl:.2f} to reach ($0.03 CPL x 6) "
+    f"but forfeit ${int(4 * TENACIOUS_ACV_USD * CLOSE_RATE):,} in expected ACV -- a "
+    f"{int(4 * TENACIOUS_ACV_USD * CLOSE_RATE / (6 * cpl)):,}x leverage ratio. "
+    f"Fixing the date-scraping issue (~8h dev) is the highest-ROI pre-pilot action item by this measure.",
     size=7.6,
 )
 

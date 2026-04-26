@@ -1,0 +1,151 @@
+{
+  "run_id": "72563c7c",
+  "run_date": "2026-04-25T19:48:50Z",
+  "csv_source": "C:\\Users\\hp\\Music\\conversion-engines\\data\\crunchbase\\crunchbase-companies-information.csv",
+  "companies_processed": 10,
+  "dry_send": true,
+  "segment_breakdown": {
+    "generic": 10
+  },
+  "avg_ai_maturity_score": 1.0,
+  "qualified_count": 10,
+  "booked_count": 0,
+  "tone_check_pass_rate": 1.0,
+  "ablation_baseline": {
+    "tau2_pass_at_1": 0.7267,
+    "method_held_out_pass": 0.74,
+    "delta_a_pp": 22.0
+  },
+  "results": [
+    {
+      "name": "Consolety",
+      "domain": "consolety.net",
+      "trace_id": "0a380993-456d-4ddf-9329-cf84332570d1",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_consolety.json"
+    },
+    {
+      "name": "Winder Research",
+      "domain": "winderresearch.com",
+      "trace_id": "9f79d7b4-55fe-444a-97df-e507beb19f59",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_winder_research.json"
+    },
+    {
+      "name": "Wiring Technologies",
+      "domain": "wiringtech.com",
+      "trace_id": "3480f6cf-31c1-4a42-b77c-951fde53b0ec",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_wiring_technologies.json"
+    },
+    {
+      "name": "Amerisk Engineering",
+      "domain": "ameriskengineering.com",
+      "trace_id": "15833603-d624-40cc-85f9-31847b3334b5",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_amerisk_engineering.json"
+    },
+    {
+      "name": "World of Wanderlust",
+      "domain": "worldofwanderlust.com",
+      "trace_id": "d16e4735-7847-4f37-a13e-7228ba2ca4b9",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_world_of_wanderlust.json"
+    },
+    {
+      "name": "Constantin Hang Machine Production",
+      "domain": "hang.de",
+      "trace_id": "d0caa16d-54e5-4c62-9882-bddab62a5e8b",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_constantin_hang_machine_production.json"
+    },
+    {
+      "name": "Western Borders",
+      "domain": "westernborders.com",
+      "trace_id": "012b17dc-ffbe-43ff-ab08-1b6abfe53e62",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_western_borders.json"
+    },
+    {
+      "name": "winVS software AG",
+      "domain": "winvs.ch",
+      "trace_id": "dea07567-74ad-4040-8ed3-664bd1134b87",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_winvs_software_ag.json"
+    },
+    {
+      "name": "WISEiTECH",
+      "domain": "wise.co.kr",
+      "trace_id": "3ce933f8-d57c-4792-b90a-3bec646094e5",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_wiseitech.json"
+    },
+    {
+      "name": "Connect It Utilities",
+      "domain": "cius.co.uk",
+      "trace_id": "6510059f-5fde-40d2-a900-01b0f5aa5592",
+      "segment": "generic",
+      "ai_maturity": 1,
+      "tone_check": true,
+      "det_ok": true,
+      "qualified": true,
+      "booking_success": false,
+      "hs_contact_id": "",
+      "file": "crunchbase_connect_it_utilities.json"
+    }
+  ]
+}

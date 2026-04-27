@@ -1,51 +1,71 @@
 services:
   - type: web
     name: tenacious-conversion-engine
-    runtime: python
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps || true
-    startCommand: uvicorn agent.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.0
+      # ── LLM ──────────────────────────────────────────────────────────────────
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_API_BASE
-        value: https://openrouter.ai/api/v1
       - key: DEV_MODEL
-        value: qwen/qwen3-next-80b-a3b-instruct
+        value: openai/gpt-4o-mini
       - key: EVAL_MODEL
         value: anthropic/claude-sonnet-4-6
       - key: TEMPERATURE
         value: "0.7"
+
+      # ── Email (Resend) ────────────────────────────────────────────────────────
       - key: RESEND_API_KEY
         sync: false
       - key: RESEND_FROM_EMAIL
         sync: false
+      # Webhook signing secret — copy from Resend dashboard → Webhooks → endpoint
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+      # Kill-switch: keep "false" until executive sign-off; all mail routes to sink
+      - key: OUTBOUND_LIVE
+        value: "false"
+      - key: STAFF_SINK_EMAIL
+        sync: false
+
+      # ── SMS (Africa's Talking) ────────────────────────────────────────────────
       - key: AFRICA_TALKING_USERNAME
         value: sandbox
       - key: AFRICA_TALKING_API_KEY
         sync: false
       - key: AFRICA_TALKING_SENDER_ID
         value: Sandbox
+
+      # ── CRM (HubSpot) ─────────────────────────────────────────────────────────
       - key: HUBSPOT_ACCESS_TOKEN
         sync: false
+
+      # ── Booking (Cal.com) ────────────────────────────────────────────────────
       - key: CALCOM_API_URL
         value: https://api.cal.com
       - key: CALCOM_API_KEY
         sync: false
       - key: CALCOM_EVENT_TYPE_SLUG
         value: discovery-call
+
+      # ── Observability (Langfuse) ─────────────────────────────────────────────
       - key: LANGFUSE_PUBLIC_KEY
         sync: false
       - key: LANGFUSE_SECRET_KEY
         sync: false
       - key: LANGFUSE_BASE_URL
         value: https://cloud.langfuse.com
+
+      # ── Database ──────────────────────────────────────────────────────────────
+      # Set to a Postgres URL (Neon / Supabase free tier recommended).
+      # SQLite is ephemeral on Render — data is lost on every redeploy.
+      - key: DATABASE_URL
+        sync: false
+
+      # ── Cost guards ───────────────────────────────────────────────────────────
       - key: MAX_COST_PER_LEAD
         value: "5.0"
       - key: DAILY_VOICE_BUDGET

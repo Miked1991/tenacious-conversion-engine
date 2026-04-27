@@ -4,6 +4,7 @@ Books a discovery call via Cal.com REST API (self-hosted Docker instance).
 
 import os
 import time
+from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
@@ -12,30 +13,43 @@ from agent.langfuse_logger import log_span
 
 load_dotenv()
 
-_CALCOM_URL = os.getenv("CALCOM_API_URL", "http://localhost:3000")
-_EVENT_SLUG = os.getenv("CALCOM_EVENT_TYPE_SLUG", "discovery-call")
+_CALCOM_URL     = os.getenv("CALCOM_API_URL", "http://localhost:3000")
+_EVENT_SLUG     = os.getenv("CALCOM_EVENT_TYPE_SLUG", "discovery-call")
+# FM-2: only offer slots during business hours (configurable, defaults 09:00–17:00 UTC)
+_BIZ_HOUR_START = int(os.getenv("BIZ_HOUR_START", "9"))
+_BIZ_HOUR_END   = int(os.getenv("BIZ_HOUR_END", "17"))
+
+
+def _is_business_hours(iso_time: str) -> bool:
+    """Return True when the slot falls within configured business hours (UTC)."""
+    try:
+        dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+        return _BIZ_HOUR_START <= dt.hour < _BIZ_HOUR_END
+    except Exception:
+        return False
 
 
 def _next_available_slot(api_key: str, event_type_id: int) -> str | None:
-    """Return the first ISO datetime slot available in the next 7 days."""
-    start = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime())
+    """Return the first business-hours slot available in the next 7 days."""
+    start  = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime())
     end_ts = time.time() + 7 * 86400
-    end = time.strftime("%Y-%m-%dT23:59:59Z", time.gmtime(end_ts))
+    end    = time.strftime("%Y-%m-%dT23:59:59Z", time.gmtime(end_ts))
     try:
-        resp = httpx.get(
+        resp  = httpx.get(
             f"{_CALCOM_URL}/api/v1/slots",
             params={
                 "eventTypeId": event_type_id,
-                "startTime": start,
-                "endTime": end,
+                "startTime":   start,
+                "endTime":     end,
             },
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=15,
         )
         slots = resp.json().get("slots", {})
         for day_slots in slots.values():
-            if day_slots:
-                return day_slots[0]["time"]
+            for slot in day_slots:
+                if _is_business_hours(slot["time"]):
+                    return slot["time"]
     except Exception:
         pass
     return None

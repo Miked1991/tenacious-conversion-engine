@@ -77,7 +77,7 @@
   },
   "email": {
     "subject": "One question about your engineering challenges",
-    "body": "Quick question: what's the biggest friction point in your engineering team today \u2014 hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
+    "body": "Quick question: what's the biggest friction point in your engineering team today — hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
     "tone_check": true,
     "det_ok": true,
     "violations": [],
@@ -86,7 +86,7 @@
       "id": "dry-run-0a380993-456d-4ddf-9329-cf84332570d1",
       "dry_run": true,
       "subject": "One question about your engineering challenges",
-      "body": "Quick question: what's the biggest friction point in your engineering team today \u2014 hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
+      "body": "Quick question: what's the biggest friction point in your engineering team today — hiring speed, capacity, or something else?\n\nI ask because Tenacious helps engineering leads solve exactly these problems with senior talent from East Africa, placed in two to three weeks.\n\nHappy to share how if it's relevant.",
       "to": "eng.consolety@consolety.net"
     }
   },
@@ -99,28 +99,28 @@
       {
         "name": "Toptal",
         "positioning": "Premium global freelance network, claims top 3% of talent",
-        "gap": "High cost ($150\u2013200/hr) and 2\u20134 week vetting delay; no East Africa presence",
-        "tenacious_advantage": "40\u201360% lower cost with equivalent senior quality and 2\u20133 week placement vs Toptal's 4-week vetting"
+        "gap": "High cost ($150–200/hr) and 2–4 week vetting delay; no East Africa presence",
+        "tenacious_advantage": "40–60% lower cost with equivalent senior quality and 2–3 week placement vs Toptal's 4-week vetting"
       },
       {
         "name": "Andela",
         "positioning": "Africa-based engineering talent marketplace",
-        "gap": "Batch / marketplace model \u2014 prospect must self-manage engineers; limited ML/AI specialization depth",
+        "gap": "Batch / marketplace model — prospect must self-manage engineers; limited ML/AI specialization depth",
         "tenacious_advantage": "Specialist matching for ML/data roles with individual vetting and a Tenacious delivery lead who manages the engagement"
       },
       {
         "name": "Upwork Enterprise",
         "positioning": "Freelance marketplace with enterprise compliance layer",
-        "gap": "Unmanaged \u2014 prospect vets, manages, and retains contractors themselves; high coordination overhead at engineering-team scale",
+        "gap": "Unmanaged — prospect vets, manages, and retains contractors themselves; high coordination overhead at engineering-team scale",
         "tenacious_advantage": "Fully managed model: Tenacious handles vetting, onboarding, and daily management so the engineering team lead can focus on product"
       }
     ],
     "recommended_angle": "Cost-effective senior engineering capacity for Consolety without the management overhead of a freelance marketplace",
-    "top_gap_summary": "No competitor offers Consolety the combination of East Africa specialist talent at 40\u201360% cost reduction with a managed delivery model. Tenacious's 2\u20133 week placement process is the fastest path to qualified generic-stage engineers.",
+    "top_gap_summary": "No competitor offers Consolety the combination of East Africa specialist talent at 40–60% cost reduction with a managed delivery model. Tenacious's 2–3 week placement process is the fastest path to qualified generic-stage engineers.",
     "generated_at": "2026-04-25T19:33:13Z"
   },
   "hubspot": {
-    "contact_id": "",
+    "contact_id": "765859945680",
     "fields": {
       "segment__c": "generic",
       "ai_maturity_score__c": "1",
@@ -132,7 +132,7 @@
     "reply_turns": [
       {
         "turn": 1,
-        "text": "Interesting \u2014 could you tell me more about the types of engineers you place?",
+        "text": "Interesting — could you tell me more about the types of engineers you place?",
         "qualified": false
       },
       {

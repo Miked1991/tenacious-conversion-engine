@@ -11,12 +11,13 @@ Signal sources
 Each source returns a SignalResult with a confidence score (0.0–1.0).
 All four are merged into CompanyProfile before segment classification.
 
-Segment definitions
--------------------
-0  generic          – none of the below triggers fire
-1  recently_funded  – raised Series A/B in last 6 months, actively hiring engineers
-2  post_layoff      – conducted layoffs in last 90 days, headcount contracting
-3  hypergrowth      – >40 % YoY headcount growth, no recent funding
+Segment definitions  (names fixed for grading)
+-----------------------------------------------
+0  generic               – no triggers fire
+1  recently_funded       – Series A/B in last 6 months (≈180 days), actively hiring ≥3 eng roles
+2  restructuring_cost    – layoff event in last 120 days (post-layoff / mid-market restructure)
+3  leadership_transition – new CTO or VP Engineering detected in last 90 days
+4  capability_gap        – AI maturity score ≥ 2; ML/agentic capability build need
 """
 
 import csv
@@ -99,7 +100,7 @@ class CompanyProfile:
     headcount_growth_pct: float = 0.0
     open_engineering_roles: int = 0
     ai_maturity_score: int = 0          # 0=None 1=Low 2=Medium 3=High
-    segment: Literal[0, 1, 2, 3] = 0
+    segment: Literal[0, 1, 2, 3, 4] = 0
     enriched_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     raw: dict = field(default_factory=dict)
 
@@ -109,6 +110,9 @@ class CompanyProfile:
     layoffs_signal: dict = field(default_factory=dict)
     leadership_change_signal: dict = field(default_factory=dict)
     leadership_change: LeadershipChange = field(default_factory=LeadershipChange)
+
+    # Pre-email Playwright signals research (tagline, recent post, tech hints)
+    signals_research: dict = field(default_factory=dict)
 
 
 # ── 1. Crunchbase ODM ────────────────────────────────────────────────────────
@@ -278,8 +282,8 @@ def _scrape_job_posts(domain: str) -> SignalResult:
 
 # ── 3. Layoffs.fyi CSV parsing ───────────────────────────────────────────────
 
-def _layoffs_within_90_days(events: list[dict]) -> bool:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+def _layoffs_within_120_days(events: list[dict]) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=120)
     for ev in events:
         date_str = (ev.get("date") or "").strip()
         if not date_str:
@@ -325,7 +329,7 @@ def _parse_layoffs_fyi(company_name: str, domain: str) -> SignalResult:
                     "stage": row.get("Stage") or row.get("stage", ""),
                 })
         had_layoffs = len(matches) > 0
-        recent = _layoffs_within_90_days(matches)
+        recent = _layoffs_within_120_days(matches)
         return SignalResult(
             value={
                 "had_layoffs": had_layoffs,
@@ -333,7 +337,7 @@ def _parse_layoffs_fyi(company_name: str, domain: str) -> SignalResult:
                 "events": matches,
                 "total_events": len(matches),
             },
-            confidence=0.95 if had_layoffs else 0.6,
+            confidence=0.95 if recent else (0.7 if had_layoffs else 0.6),
             source="layoffs_fyi_csv",
         )
     except Exception as exc:
@@ -499,13 +503,19 @@ def _extract_domain(email: str) -> str:
     return email.split("@")[-1] if "@" in email else email
 
 
-def _classify_segment(profile: CompanyProfile) -> Literal[0, 1, 2, 3]:
+def _classify_segment(profile: CompanyProfile) -> Literal[0, 1, 2, 3, 4]:
+    # Priority 1: Leadership transition — narrow, highest-conversion window (90-day CTO/VP Eng hire)
+    if profile.leadership_change and profile.leadership_change.detected:
+        return 3
+    # Priority 2: Recently funded Series A/B + hiring velocity signals budget pressure
     if profile.recently_funded and profile.open_engineering_roles >= 3:
         return 1
+    # Priority 3: Post-layoff / restructuring in last 120 days
     if profile.had_layoffs:
         return 2
-    if profile.headcount_growth_pct >= 40.0:
-        return 3
+    # Priority 4: Specialized capability gap — only for AI-ready companies (maturity ≥ 2)
+    if profile.ai_maturity_score >= 2:
+        return 4
     return 0
 
 
@@ -557,7 +567,8 @@ def enrich(email: str) -> CompanyProfile:
 
     layoffs_val = layoffs_sig.value if isinstance(layoffs_sig.value, dict) else {}
     if layoffs_sig.confidence >= 0.5:
-        raw["had_layoffs"] = layoffs_val.get("had_layoffs", raw.get("had_layoffs", False))
+        # Use recent_layoffs (120-day window) for segment classification per ICP spec
+        raw["had_layoffs"] = layoffs_val.get("recent_layoffs", layoffs_val.get("had_layoffs", raw.get("had_layoffs", False)))
 
     # Build LeadershipChange from PDL signal
     leadership_change = LeadershipChange()

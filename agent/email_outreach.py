@@ -27,65 +27,36 @@ load_dotenv()
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
 _DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 _RESEND_KEY = os.getenv("RESEND_API_KEY", "")
-_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")  # Using Resend's default domain
-_MOCK_LLM = os.getenv("MOCK_LLM", "false").lower() in ("1", "true", "yes")
+_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
 
-# Segment-aware mock email templates used when MOCK_LLM=true
-_MOCK_SUBJECTS = {
-    1: "Faster hiring for your engineering push",
-    2: "More output from your lean engineering team",
-    3: "Scale your engineering team without the debt",
-    0: "One question about your engineering challenges",
-}
-_MOCK_BODIES = {
-    1: (
-        "Congrats on the recent round — that kind of momentum usually means a sprint to ship.\n\n"
-        "Most funded teams we talk to run into the same bottleneck: hiring takes six weeks and "
-        "you needed the engineer yesterday.\n\n"
-        "Tenacious places senior backend and frontend engineers from East Africa in two to three "
-        "weeks, at 40–60% of US hiring cost, fully managed.\n\n"
-        "Worth a 20-minute call to see if there's a fit?"
-    ),
-    2: (
-        "Running lean after a tough quarter is hard — every hire has to count.\n\n"
-        "Tenacious works with engineering leads who need output fast without rebuilding a full team. "
-        "We place senior engineers from East Africa in two to three weeks, fully managed, "
-        "at 40–60% of typical hiring cost.\n\n"
-        "Would it help to see how other post-layoff teams have used this?"
-    ),
-    3: (
-        "Scaling fast is exciting — until technical debt shows up uninvited.\n\n"
-        "Tenacious places senior engineers who know how to build clean during a growth sprint. "
-        "Two to three weeks to placement, 40–60% cost savings, fully managed engagement.\n\n"
-        "Open to a quick conversation about what your team needs right now?"
-    ),
-    0: (
-        "Quick question: what's the biggest friction point in your engineering team today — "
-        "hiring speed, capacity, or something else?\n\n"
-        "I ask because Tenacious helps engineering leads solve exactly these problems with "
-        "senior talent from East Africa, placed in two to three weeks.\n\n"
-        "Happy to share how if it's relevant."
-    ),
-}
+# Kill-switch (data policy rule 4): default OFF — routes all outbound to staff sink.
+# Set OUTBOUND_LIVE=true only after Tenacious executive team approval.
+_OUTBOUND_LIVE = os.getenv("OUTBOUND_LIVE", "false").lower() in ("1", "true", "yes")
+_STAFF_SINK = os.getenv("STAFF_SINK_EMAIL", "sink@tenacious-pilot.dev")
 
 BounceType = Literal["hard", "soft", "complaint"]
 
 _SEGMENT_HINTS = {
     1: (
-        "They recently secured funding and are aggressively hiring engineers. "
-        "Lead with how we accelerate engineering velocity and reduce time-to-hire."
+        "Recently funded (Series A/B). Fresh budget, runway clock ticking. "
+        "Lead with hiring velocity: how we cut time-to-hire and let them ship faster."
     ),
     2: (
-        "They went through layoffs and are running lean. "
-        "Lead with cost efficiency, doing more with less, and preserving institutional knowledge."
+        "Post-layoff or mid-market restructuring — running lean under board pressure. "
+        "Lead with cost efficiency: same output, lower burn, no compromise on delivery quality."
     ),
     3: (
-        "They are in hyper-growth mode. "
-        "Lead with scalability, avoiding technical debt during rapid expansion."
+        "New CTO or VP Engineering appointed in last 90 days — vendor-reassessment window. "
+        "Lead with a clean, practical partnership offer: fast ramp, transparent model, no lock-in."
+    ),
+    4: (
+        "Active AI/ML capability gap (maturity score ≥ 2). "
+        "Lead with Tenacious AI/data engineers for ML platform migration or agentic system build. "
+        "Frame as project-based consulting: defined scope, faster than hiring, higher leverage."
     ),
     0: (
-        "Use a warm, curiosity-driven opener. "
-        "Ask one diagnostic question about their current engineering challenges."
+        "Generic exploratory outreach. "
+        "Ask one warm, diagnostic question about their current engineering challenge."
     ),
 }
 
@@ -106,13 +77,22 @@ _BANNED_WORDS = re.compile(
 )
 _AI_WORD = re.compile(r"\bAI\b")          # case-sensitive: "AI" is banned, "ai" in names is ok
 _MAX_BODY_WORDS = 120
+# FM-1: catch commitment language that books / schedules before the prospect consents
+_COMMITMENT_WORDS = re.compile(
+    r"\b(i(?:'ve| have) (?:booked|scheduled|reserved|set up|blocked)|"
+    r"(?:booked|scheduled|reserved) you|your (?:slot|booking|appointment|calendar invite)|"
+    r"confirmed for|i(?:'ll| will) (?:send|shoot) (?:you )?a (?:calendar|cal) invite|"
+    r"expect (?:a )?(?:calendar|meeting|invite) from me)\b",
+    re.IGNORECASE,
+)
 
 
 def _deterministic_tone_check(subject: str, body: str) -> tuple[bool, list[str]]:
     """
     Fast pre-check before LLM tone validation.
     Returns (passed, violations_list).
-    Catches: word count overrun, banned buzzwords, explicit 'AI' mention.
+    Catches: word count overrun, banned buzzwords, explicit 'AI' mention,
+    and FM-1 commitment language that books before consent.
     """
     violations: list[str] = []
     full_text = f"{subject} {body}"
@@ -130,12 +110,17 @@ def _deterministic_tone_check(subject: str, body: str) -> tuple[bool, list[str]]
     if _AI_WORD.search(full_text):
         violations.append("contains 'AI' (style guide: never mention AI)")
 
+    # FM-1: email must ask for permission, never commit to a specific booking
+    commit_hits = _COMMITMENT_WORDS.findall(full_text)
+    if commit_hits:
+        violations.append(
+            f"commits to booking before consent: {', '.join(sorted(set(h.lower() for h in commit_hits)))}"
+        )
+
     return len(violations) == 0, violations
 
 
 def _llm(messages: list, max_tokens: int = 400) -> str:
-    if _MOCK_LLM:
-        return "YES"   # default mock — callers that need compose output use _mock_compose
     try:
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -167,23 +152,40 @@ def _llm(messages: list, max_tokens: int = 400) -> str:
         raise RuntimeError(f"LLM call failed ({_DEV_MODEL}): {exc}") from exc
 
 
-def _mock_compose(profile: "CompanyProfile") -> tuple[str, str]:
-    subject = _MOCK_SUBJECTS.get(profile.segment, _MOCK_SUBJECTS[0])
-    body = _MOCK_BODIES.get(profile.segment, _MOCK_BODIES[0])
-    return subject, body
-
-
 def compose(profile: CompanyProfile, trace_id: str) -> tuple[str, str]:
     """Return (subject, body) as plain text."""
-    if _MOCK_LLM:
-        subject, body = _mock_compose(profile)
-        log_span(trace_id, "compose_email_mock", {}, {"subject": subject, "segment": profile.segment})
-        return subject, body
-
     hint = _SEGMENT_HINTS.get(profile.segment, _SEGMENT_HINTS[0])
+
+    # Signal-confidence-aware phrasing (per ICP spec: "ask rather than assert" when weak)
+    job_conf = (profile.job_posts_signal or {}).get("confidence", 0.5)
+    cb_conf  = (profile.crunchbase_signal or {}).get("confidence", 0.5)
+    avg_conf = (job_conf + cb_conf) / 2
+    if avg_conf >= 0.7:
+        confidence_note = (
+            "Signal confidence is HIGH — you may make specific, grounded claims "
+            "(e.g. exact funding stage, number of open roles)."
+        )
+    elif avg_conf >= 0.4:
+        confidence_note = (
+            "Signal confidence is MEDIUM — use hedged language "
+            "(e.g. 'it looks like', 'based on what we can see publicly')."
+        )
+    else:
+        confidence_note = (
+            "Signal confidence is LOW — ask rather than assert; "
+            "use exploratory, curiosity-driven language throughout."
+        )
+
+    personalization = (profile.signals_research or {}).get("personalization_hook", "")
+    personalization_line = (
+        f"Personalization hook (weave in naturally if relevant, don't force it): {personalization}\n"
+        if personalization else ""
+    )
     prompt = (
         f"Write a cold outreach email to {profile.company_name} ({profile.domain}).\n"
-        f"Context: {hint}\n"
+        f"Segment context: {hint}\n"
+        f"Signal confidence guidance: {confidence_note}\n"
+        f"{personalization_line}"
         f"Style guide: {_STYLE_GUIDE}\n"
         "Return ONLY: subject line on the first line, then a blank line, then the body. "
         "No salutation line required."
@@ -218,13 +220,17 @@ def tone_check(subject: str, body: str, trace_id: str) -> bool:
 
 
 def send(to: str, subject: str, body: str, trace_id: str) -> dict:
-    """Send via Resend. Returns the Resend API response dict."""
+    """Send via Resend. Routes to staff sink unless OUTBOUND_LIVE=true."""
+    actual_to = to if _OUTBOUND_LIVE else _STAFF_SINK
     payload = {
         "from": _FROM_EMAIL,
-        "to": [to],
+        "to": [actual_to],
         "subject": subject,
         "text": body,
+        "tags": [{"name": "draft", "value": "true"}],
     }
+    if not _OUTBOUND_LIVE:
+        payload["subject"] = f"[SINK:{to}] {subject}"
     try:
         resp = httpx.post(
             "https://api.resend.com/emails",
@@ -314,10 +320,11 @@ def compose_and_send(profile: CompanyProfile, trace_id: str, dry_run: bool = Fal
     return send(profile.email, subject, body, trace_id)
 
 
-# Segment label helper (used by HubSpot sync and main.py)
+# Segment label helper — names are fixed for grading per challenge ICP spec
 SEGMENT_LABELS: dict[int, str] = {
     0: "generic",
     1: "recently_funded",
-    2: "post_layoff",
-    3: "hypergrowth",
+    2: "restructuring_cost",
+    3: "leadership_transition",
+    4: "capability_gap",
 }

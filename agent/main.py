@@ -27,6 +27,7 @@ SMS channel hierarchy
 """
 
 import base64
+import dataclasses as _dc
 import hashlib
 import hmac
 import logging
@@ -138,7 +139,7 @@ def _run_full_pipeline(email: str, text: str) -> dict:
 
     lead         = db.get_or_create(email)
     lead.status  = "outreach_sent"
-    lead.profile = {**profile.__dict__, "competitor_gap_brief": gap_brief}
+    lead.profile = {**_dc.asdict(profile), "competitor_gap_brief": gap_brief}
 
     name_parts = email.split("@")[0].split(".")
     first      = name_parts[0].title()

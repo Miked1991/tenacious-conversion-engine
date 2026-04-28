@@ -151,6 +151,23 @@ def link_phone(email: str, phone: str) -> None:
             row.updated_at = _now()
 
 
+def list_all() -> list[Lead]:
+    """Return all leads ordered by created_at descending."""
+    with _session() as db:
+        rows = db.query(_LeadRow).order_by(_LeadRow.created_at.desc()).all()
+        return [_row_to_lead(r) for r in rows]
+
+
+def delete_lead(email: str) -> bool:
+    """Delete a lead by email. Returns True if deleted, False if not found."""
+    with _session() as db:
+        row = db.get(_LeadRow, email)
+        if row is None:
+            return False
+        db.delete(row)
+        return True
+
+
 def save_lead(lead: Lead) -> None:
     """Upsert all mutable fields for a lead."""
     with _session() as db:

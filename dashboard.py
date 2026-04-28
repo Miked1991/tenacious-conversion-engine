@@ -1,2289 +1,2340 @@
 """
-Conversion Engine Interactive Dashboard
-Run: python dashboard.py
-Open: http://localhost:8001
+Dashboard for the Tenacious Conversion Agent.
+
+GET  /                         – white-theme browser UI
+POST /api/pipeline/run         – start async step-by-step pipeline
+GET  /api/pipeline/history     – all finished runs, newest first
+GET  /api/pipeline/{id}        – poll a single run's state
+POST /api/pipeline/{id}/approve – approve (+ optionally edit) composed email
+POST /api/pipeline/{id}/reject  – cancel the run
+POST /api/email/compose        – compose draft only (no send)
+POST /api/email/send           – send a pre-composed draft
+POST /api/gap/analyze          – competitor gap for any lead email
+POST /api/crm/sync             – manual HubSpot upsert
+GET  /api/leads                – all leads (JSON)
+GET  /api/leads/{email_b64}    – single lead detail
+DELETE /api/leads/{email_b64}  – remove a lead
 """
+
+import asyncio
+import base64
 import csv
 import dataclasses as _dc
+import hashlib
+import hmac
 import io
-import json
+import logging
 import os
-import sys
-import threading
+import re
 import time
 import uuid
-from pathlib import Path
-
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
-import uvicorn
-
-BASE_DIR = Path(__file__).parent
-sys.path.insert(0, str(BASE_DIR))
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
 load_dotenv()
-app = FastAPI(title="Conversion Engine Dashboard")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+from agent import db
+from agent import enrichment_pipeline as enrich_mod
+from agent import email_outreach as email_mod
+from agent import conversation_handler as conv
+from agent import booking_handler as booking
+from agent import hubspot_sync as hs
+from agent import langfuse_logger as lf
+from agent import sms_handler as sms_mod
+from agent import competitor_gap as gap_mod
+from agent import signals_research as signals_mod
 
-@app.get("/api/batch-results")
-def get_batch_results():
-    results_dir = BASE_DIR / "eval" / "crunchbase-result"
-    results = []
-    if results_dir.exists():
-        files = sorted(results_dir.glob("crunchbase_*.json"),
-                       key=lambda f: f.stat().st_mtime, reverse=True)
-        for jf in files:
-            if "summary" not in jf.name:
-                try:
-                    data = json.loads(jf.read_text(encoding="utf-8"))
-                    data["_slug"] = jf.stem
-                    results.append(data)
-                except Exception:
-                    pass
-    return JSONResponse(results)
+_CALCOM_API_KEY        = os.getenv("CALCOM_API_KEY", "")
+_AT_USERNAME           = os.getenv("AFRICA_TALKING_USERNAME", "sandbox")
+_RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
+_OUTBOUND_LIVE         = os.getenv("OUTBOUND_LIVE", "false").lower() in ("1", "true", "yes")
+_STAFF_SINK            = os.getenv("STAFF_SINK_EMAIL", "sink@tenacious-pilot.dev")
 
+logger = logging.getLogger(__name__)
 
-@app.get("/api/db-leads")
-def get_db_leads():
-    db_path = BASE_DIR / "leads.db"
-    if not db_path.exists():
-        return JSONResponse([])
-    try:
-        from sqlalchemy import create_engine, text
-        engine = create_engine(
-            f"sqlite:///{db_path}",
-            connect_args={"check_same_thread": False},
-        )
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM leads ORDER BY COALESCE(updated_at,'') DESC, created_at DESC")
-            ).mappings()
-            leads = []
-            for row in rows:
-                lead = dict(row)
-                lead["profile"] = json.loads(lead.pop("profile_json", None) or "{}")
-                lead["history"] = json.loads(lead.pop("history_json", None) or "[]")
-                leads.append(lead)
-        return JSONResponse(leads)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Tenacious Dashboard")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+_executor      = ThreadPoolExecutor(max_workers=4)
+_active_tasks: set          = set()
+_RUN_STORE:    dict[str, dict] = {}
+_RUN_HISTORY:  list[dict]      = []   # newest first, max 50
 
-@app.get("/api/traces")
-def get_traces():
-    tf = BASE_DIR / "held_out_traces.jsonl"
-    if not tf.exists():
-        return JSONResponse([])
-    traces = []
-    for line in tf.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                traces.append(json.loads(line))
-            except Exception:
-                pass
-    return JSONResponse(traces)
+# Batch run state (single concurrent batch at a time)
+_BATCH: dict = {
+    "status":       "idle",   # idle|running|completed|failed
+    "total":        0,
+    "done":         0,
+    "failed_count": 0,
+    "current":      None,
+    "results":      [],
+    "started_at":   None,
+    "completed_at": None,
+}
 
+# ── File parsing helpers ──────────────────────────────────────────────────────
 
-class _EmailBody(BaseModel):
-    email: str
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+def _domain_from_url(url: str) -> str:
+    url = url.strip().rstrip("/")
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    return url.split("/")[0].split("?")[0]
 
-@app.get("/api/debug-calcom")
-def debug_calcom():
-    import httpx as _hx
-    url  = os.getenv("CALCOM_API_URL", "http://localhost:3000")
-    key  = os.getenv("CALCOM_API_KEY", "")
-    slug = os.getenv("CALCOM_EVENT_TYPE_SLUG", "discovery-call")
-    if not key:
-        return JSONResponse({"error": "CALCOM_API_KEY not set", "url": url, "slug": slug})
-    is_cloud = "api.cal.com" in url
-    # probe v2 for cloud, v1 for self-hosted
-    if is_cloud:
-        h2 = {"Authorization": f"Bearer {key}", "cal-api-version": "2024-08-13"}
-        results = {}
-        # Get username from /v2/me first
-        username = None
-        user_id  = None
-        try:
-            me = _hx.get("https://api.cal.com/v2/me", headers=h2, timeout=10).json()
-            username = me.get("data", {}).get("username", "")
-            user_id  = me.get("data", {}).get("id", "")
-            results["/v2/me"] = {"status": 200, "username": username, "id": user_id}
-        except Exception as exc:
-            results["/v2/me"] = {"error": str(exc)}
-        # Probe event-type paths
-        probes = {
-            "v2 by username":  f"https://api.cal.com/v2/event-types?username={username}",
-            "v2 by user id":   f"https://api.cal.com/v2/users/{user_id}/event-types",
-            "v1 apiKey api":   f"https://api.cal.com/v1/event-types?apiKey={key}",
-            "v1 apiKey app":   f"https://app.cal.com/api/v1/event-types?apiKey={key}",
-            "public user page":f"https://cal.com/api/trpc/public/event-types?batch=1&input=%7B%220%22%3A%7B%22username%22%3A%22{username}%22%7D%7D",
-        }
-        for label, full_url in probes.items():
-            try:
-                r = _hx.get(full_url, timeout=10)
-                d = r.json()
-                if isinstance(d, list):
-                    d = d[0] if d else {}
-                ets = (d.get("result", {}).get("data", {}).get("eventTypes")
-                       or d.get("event_types") or d.get("data") or [])
-                if isinstance(ets, list):
-                    ets_summary = [{"id": e.get("id"), "slug": e.get("slug"), "title": e.get("title")} for e in ets[:10]]
-                else:
-                    ets_summary = str(d)[:300]
-                results[label] = {"status": r.status_code, "event_types": ets_summary}
-            except Exception as exc:
-                results[label] = {"error": str(exc)}
-        et_id_env = os.getenv("CALCOM_EVENT_TYPE_ID", "")
-        return JSONResponse({
-            "api": "v2", "username": username, "user_id": user_id,
-            "slug_target": slug,
-            "CALCOM_EVENT_TYPE_ID_set": bool(et_id_env),
-            "CALCOM_EVENT_TYPE_ID": et_id_env or None,
-            "fix_if_missing": (
-                "Visit app.cal.com/event-types, open your event type, "
-                "copy the number from the URL (e.g. /event-types/12345), "
-                "then set CALCOM_EVENT_TYPE_ID=12345 in .env and restart."
-            ),
-            "probes": results,
+def _parse_csv_bytes(content: bytes) -> list[dict]:
+    text   = content.decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    leads  = []
+    for row in reader:
+        r = {k.lower().strip(): (v or "").strip() for k, v in row.items()}
+        email = ""
+        for col in ("email", "contact_email", "email_address", "e-mail", "mail"):
+            val = r.get(col, "")
+            if val and "@" in val and "█" not in val and "■" not in val:
+                email = val
+                break
+        domain = ""
+        for col in ("website", "url", "domain", "site", "web", "homepage"):
+            val = r.get(col, "")
+            if val:
+                domain = _domain_from_url(val)
+                break
+        if not email and domain:
+            email = f"founder@{domain}"
+        if not email:
+            continue
+        company = ""
+        for col in ("name", "company", "company_name", "organization", "org", "account"):
+            val = r.get(col, "")
+            if val:
+                company = val
+                break
+        leads.append({
+            "email":   email,
+            "company": company,
+            "domain":  domain or email.split("@")[1],
+            "source":  "direct" if ("founder@" not in email) else "synthesized",
         })
-    else:
-        try:
-            r = _hx.get(f"{url}/api/v1/event-types",
-                         headers={"Authorization": f"Bearer {key}"}, timeout=10)
-            data = r.json()
-            ets = [{"id": e.get("id"), "slug": e.get("slug"), "title": e.get("title")}
-                   for e in data.get("event_types", [])]
-            return JSONResponse({"api": "v1", "url": url, "slug_target": slug,
-                                 "status": r.status_code, "event_types": ets})
-        except Exception as exc:
-            return JSONResponse({"api": "v1", "error": str(exc)})
+    return leads
+
+def _emails_from_text(text: str) -> list[dict]:
+    found  = list(dict.fromkeys(_EMAIL_RE.findall(text)))   # dedupe, preserve order
+    return [
+        {
+            "email":   e,
+            "company": e.split("@")[1].split(".")[0].title(),
+            "domain":  e.split("@")[1],
+            "source":  "extracted",
+        }
+        for e in found
+    ]
+
+def _parse_pdf_bytes(content: bytes) -> list[dict]:
+    try:
+        import pdfplumber
+        text = ""
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or "") + "\n"
+    except ImportError:
+        raise RuntimeError("pdfplumber not installed — run: pip install pdfplumber")
+    return _emails_from_text(text)
+
+def _parse_docx_bytes(content: bytes) -> list[dict]:
+    try:
+        from docx import Document
+        doc  = Document(io.BytesIO(content))
+        text = "\n".join(p.text for p in doc.paragraphs)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    text += "\n" + cell.text
+    except ImportError:
+        raise RuntimeError("python-docx not installed — run: pip install python-docx")
+    return _emails_from_text(text)
 
 
-def _book_calcom(email: str, name: str, trace_id: str) -> dict:
-    """Book via Cal.com v2 (cloud api.cal.com) or v1 (self-hosted)."""
-    import httpx as _hx, time as _t
-    from datetime import datetime, timezone as _tz
+# ── Webhook signature helpers ─────────────────────────────────────────────────
 
-    url  = os.getenv("CALCOM_API_URL", "http://localhost:3000")
-    key  = os.getenv("CALCOM_API_KEY", "")
-    slug = os.getenv("CALCOM_EVENT_TYPE_SLUG", "discovery-call")
-    biz_s = int(os.getenv("BIZ_HOUR_START", "9"))
-    biz_e = int(os.getenv("BIZ_HOUR_END", "17"))
-
-    if not key:
-        return {"success": False, "booking_url": "", "slot": "", "error": "CALCOM_API_KEY not set"}
-
-    def _biz(iso: str) -> bool:
-        try:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-            return biz_s <= dt.hour < biz_e
-        except Exception:
+def _verify_resend_signature(headers: dict, raw_body: bytes) -> bool:
+    if not _RESEND_WEBHOOK_SECRET:
+        return True
+    msg_id     = headers.get("svix-id", "")
+    timestamp  = headers.get("svix-timestamp", "")
+    sig_header = headers.get("svix-signature", "")
+    if not (msg_id and timestamp and sig_header):
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
             return False
+    except ValueError:
+        return False
+    signed       = f"{msg_id}.{timestamp}.{raw_body.decode()}"
+    secret_bytes = base64.b64decode(_RESEND_WEBHOOK_SECRET.removeprefix("whsec_"))
+    expected     = base64.b64encode(
+        hmac.new(secret_bytes, signed.encode(), hashlib.sha256).digest()
+    ).decode()
+    for sig in sig_header.split(" "):
+        _, actual = sig.split(",", 1) if "," in sig else ("v1", sig)
+        if hmac.compare_digest(expected, actual):
+            return True
+    return False
 
-    if "api.cal.com" in url:
-        base = "https://api.cal.com/v2"
-        hdrs = {"Authorization": f"Bearer {key}", "cal-api-version": "2024-08-13",
-                "Content-Type": "application/json"}
-        try:
-            r = _hx.get(f"{base}/event-types", headers=hdrs, timeout=10)
-            ets = r.json().get("data", [])
-        except Exception as exc:
-            return {"success": False, "booking_url": "", "slot": "", "error": str(exc)}
 
-        # Direct override: CALCOM_EVENT_TYPE_ID skips the listing step
-        et_id_env = os.getenv("CALCOM_EVENT_TYPE_ID", "")
-        if et_id_env:
-            et_id = int(et_id_env)
-        else:
-            et_id = next((e["id"] for e in ets if e.get("slug") == slug), None)
-        if not et_id:
-            return {"success": False, "booking_url": "", "slot": "",
-                    "error": (
-                        "Event type not found. "
-                        "Open app.cal.com/event-types, click your event type, "
-                        "copy the numeric ID from the URL, then add "
-                        "CALCOM_EVENT_TYPE_ID=<id> to your .env and restart."
-                    )}
+def _verify_at_webhook(raw: dict) -> bool:
+    return raw.get("username") == _AT_USERNAME
 
-        now = _t.strftime("%Y-%m-%dT00:00:00.000Z", _t.gmtime())
-        end = _t.strftime("%Y-%m-%dT23:59:59.000Z", _t.gmtime(_t.time() + 7 * 86400))
-        try:
-            r = _hx.get(f"{base}/slots/available",
-                        params={"startTime": now, "endTime": end, "eventTypeId": et_id},
-                        headers=hdrs, timeout=15)
-            slots_by_day = r.json().get("data", {}).get("slots", {})
-        except Exception as exc:
-            return {"success": False, "booking_url": "", "slot": "", "error": str(exc)}
 
-        slot = next((s["time"] for day in slots_by_day.values()
-                     for s in day if _biz(s.get("time", ""))), None)
-        if not slot:
-            return {"success": False, "booking_url": "", "slot": "",
-                    "error": "no available business-hours slots in next 7 days"}
+# ── Sync pipeline helpers (used by webhook routes) ────────────────────────────
 
-        try:
-            r = _hx.post(f"{base}/bookings", headers=hdrs, timeout=20, json={
-                "eventTypeId": et_id,
-                "start": slot,
-                "attendee": {"name": name or email.split("@")[0].title(),
-                             "email": email, "timeZone": "UTC", "language": "en"},
-            })
-            data = r.json()
-            uid = data.get("data", {}).get("uid", "")
-            booking_url = f"https://cal.com/booking/{uid}" if uid else ""
-            return {"success": bool(uid), "booking_url": booking_url, "slot": slot,
-                    "_raw": data.get("data", {})}
-        except Exception as exc:
-            return {"success": False, "booking_url": "", "slot": slot, "error": str(exc)}
+def _run_full_pipeline(email: str, text: str) -> dict:
+    trace_id        = lf.log_trace("first_contact", {"email": email, "text": text}, None)
+    profile         = enrich_mod.enrich(email)
+    lf.log_span(trace_id, "enrich", {"email": email}, profile.__dict__)
+    company_signals = signals_mod.research(profile.domain, trace_id)
+    profile.signals_research = company_signals.to_dict()
+    lf.log_span(trace_id, "signals_research", {"domain": profile.domain}, profile.signals_research)
+    gap_brief        = gap_mod.generate_competitor_gap_brief(profile, trace_id)
+    send_result      = email_mod.compose_and_send(profile, trace_id)
+    lead             = db.get_or_create(email)
+    lead.status      = "outreach_sent"
+    lead.profile     = {**_dc.asdict(profile), "competitor_gap_brief": gap_brief}
+    name_parts       = email.split("@")[0].split(".")
+    first            = name_parts[0].title()
+    last             = name_parts[1].title() if len(name_parts) > 1 else ""
+    contact_id       = hs.upsert_contact(
+        email=email, first_name=first, last_name=last,
+        company=profile.company_name,
+        segment_label=email_mod.SEGMENT_LABELS[profile.segment],
+        ai_maturity_score=profile.ai_maturity_score,
+        booking_url="", enrichment_ts=profile.enriched_at, trace_id=trace_id,
+    )
+    lead.hubspot_contact_id = contact_id
+    db.save_lead(lead)
+    lf.log_trace("first_contact_complete", {"email": email}, send_result, session_id=lead.lead_id)
+    return {
+        "lead_id": lead.lead_id, "status": "outreach_sent",
+        "send_result": send_result,
+        "segment": email_mod.SEGMENT_LABELS[profile.segment],
+        "ai_maturity_score": profile.ai_maturity_score,
+        "competitor_gap_brief": gap_brief,
+    }
+
+
+def _run_reply_pipeline(identifier: str, text: str) -> dict:
+    trace_id = lf.log_trace("reply", {"identifier": identifier, "text": text}, None)
+    result   = conv.handle_reply(identifier, text, trace_id)
+    lead     = db.get_or_create(identifier)
+    if result["qualified"] and not lead.booking_url:
+        name_parts     = identifier.split("@")[0].split(".") if "@" in identifier else [identifier]
+        name           = " ".join(p.title() for p in name_parts)
+        booking_result = booking.book(identifier, name, trace_id, api_key=_CALCOM_API_KEY)
+        lead.booking_url = booking_result.get("booking_url", "")
+        profile          = lead.profile
+        hs.upsert_contact(
+            email=identifier if "@" in identifier else profile.get("email", identifier),
+            first_name=name_parts[0].title(),
+            last_name=name_parts[1].title() if len(name_parts) > 1 else "",
+            company=profile.get("company_name", ""),
+            segment_label=email_mod.SEGMENT_LABELS.get(profile.get("segment", 0), "generic"),
+            ai_maturity_score=profile.get("ai_maturity_score", 2),
+            booking_url=lead.booking_url,
+            enrichment_ts=profile.get("enriched_at", ""),
+            trace_id=trace_id,
+        )
+        if lead.phone and lead.booking_url:
+            sms_confirmation = sms_mod.send_booking_confirmation_sms(
+                phone=lead.phone,
+                booking_title=booking_result.get("title", "Discovery Call"),
+                start_time=booking_result.get("start", ""),
+                booking_url=lead.booking_url,
+            )
+            result["sms_confirmation"] = sms_confirmation
+        result["booking_url"]    = lead.booking_url
+        result["booking_result"] = booking_result
+        db.save_lead(lead)
+    lf.log_trace("reply_complete", {"identifier": identifier}, result, session_id=lead.lead_id)
+    return result
+
+
+# ── Async pipeline ────────────────────────────────────────────────────────────
+
+def _push_to_history(run: dict) -> None:
+    _RUN_HISTORY[:] = [r for r in _RUN_HISTORY if r["run_id"] != run["run_id"]]
+    snap = {k: run.get(k) for k in (
+        "run_id", "email", "status", "started_at", "completed_at",
+        "result", "error", "gap_brief", "email_draft",
+    )}
+    snap["steps"]      = dict(run["steps"])
+    snap["step_order"] = list(run["step_order"])
+    _RUN_HISTORY.insert(0, snap)
+    del _RUN_HISTORY[50:]
+
+
+async def _pipeline_task(run_id: str) -> None:
+    run   = _RUN_STORE[run_id]
+    email = run["email"]
+    text  = run["text"]
+    loop  = asyncio.get_running_loop()
+
+    def s_start(name: str) -> None:
+        run["steps"][name] = {"name": name, "status": "running",
+                              "data": None, "error": None, "ts": time.time()}
+        if name not in run["step_order"]:
+            run["step_order"].append(name)
+
+    def s_done(name: str, data=None) -> None:
+        if name in run["steps"]:
+            run["steps"][name]["status"] = "done"
+            run["steps"][name]["data"]   = data
+
+    def s_err(name: str, err: str) -> None:
+        if name in run["steps"]:
+            run["steps"][name]["status"] = "error"
+            run["steps"][name]["error"]  = err
+
+    try:
+        run["status"] = "running"
+
+        # 1 ── Enrichment
+        s_start("Enrichment")
+        trace_id = lf.log_trace("first_contact", {"email": email, "text": text}, None)
+        run["trace_id"] = trace_id
+        profile = await loop.run_in_executor(_executor, enrich_mod.enrich, email)
+        s_done("Enrichment", {
+            "company":  profile.company_name,
+            "domain":   profile.domain,
+            "segment":  profile.segment,
+            "cb_source":  (profile.crunchbase_signal or {}).get("source", "—"),
+            "cb_conf":    round((profile.crunchbase_signal or {}).get("confidence", 0), 2),
+            "jobs_roles": profile.open_engineering_roles,
+            "layoffs":    profile.had_layoffs,
+        })
+
+        # 2 ── Signals Research
+        s_start("Signals Research")
+        company_signals = await loop.run_in_executor(
+            _executor, signals_mod.research, profile.domain, trace_id
+        )
+        profile.signals_research = company_signals.to_dict()
+        hook = (profile.signals_research or {}).get("personalization_hook", "")
+        s_done("Signals Research", {"hook": (hook or "—")[:80]})
+
+        # 3 ── Competitor Gap
+        s_start("Competitor Gap")
+        gap_brief = await loop.run_in_executor(
+            _executor, gap_mod.generate_competitor_gap_brief, profile, trace_id
+        )
+        run["gap_brief"] = gap_brief
+        s_done("Competitor Gap", {
+            "angle":   gap_brief.get("recommended_angle", "")[:100],
+            "summary": gap_brief.get("top_gap_summary", "")[:120],
+        })
+
+        # 4 ── Compose email — PAUSE for human approval
+        s_start("Email Composition")
+        subject, body_text = await loop.run_in_executor(
+            _executor, email_mod.compose, profile, trace_id
+        )
+        det_ok, _ = email_mod._deterministic_tone_check(subject, body_text)
+        if not det_ok:
+            subject, body_text = await loop.run_in_executor(
+                _executor, email_mod.compose, profile, trace_id
+            )
+
+        run["email_draft"] = {"to": email, "subject": subject, "body": body_text}
+        run["profile"]     = _dc.asdict(profile)
+        run["profile"]["competitor_gap_brief"] = gap_brief
+
+        run["steps"]["Email Composition"]["status"] = "awaiting_approval"
+        run["steps"]["Email Composition"]["data"]   = {
+            "to": email, "subject": subject, "body": body_text,
+        }
+        run["status"] = "awaiting_approval"
+
+        # wait up to 10 min for human to approve/reject
+        for _ in range(1200):
+            if run["status"] in ("approved", "rejected"):
+                break
+            await asyncio.sleep(0.5)
+
+        if run["status"] == "rejected":
+            run["steps"]["Email Composition"]["status"] = "rejected"
+            run["status"] = "rejected"
+            run["completed_at"] = time.time()
+            _push_to_history(run)
+            return
+
+        if run["status"] != "approved":
+            run["status"] = "failed"
+            run["error"]  = "Email approval timed out (10 min)"
+            run["completed_at"] = time.time()
+            _push_to_history(run)
+            return
+
+        run["steps"]["Email Composition"]["status"] = "done"
+
+        # 5 ── Send email
+        draft = run["email_draft"]
+        s_start("Email Send")
+        send_result = await loop.run_in_executor(
+            _executor, email_mod.send,
+            draft["to"], draft["subject"], draft["body"], run["trace_id"],
+        )
+        s_done("Email Send", {
+            "message_id": send_result.get("id", ""),
+            "to": draft["to"],
+        })
+
+        # 6 ── HubSpot sync
+        s_start("HubSpot Sync")
+        lead        = db.get_or_create(email)
+        lead.status = "outreach_sent"
+        lead.profile = run["profile"]
+        name_parts   = email.split("@")[0].split(".")
+        first        = name_parts[0].title()
+        last         = name_parts[1].title() if len(name_parts) > 1 else ""
+
+        def _hs_sync():
+            return hs.upsert_contact(
+                email=email, first_name=first, last_name=last,
+                company=profile.company_name,
+                segment_label=email_mod.SEGMENT_LABELS[profile.segment],
+                ai_maturity_score=profile.ai_maturity_score,
+                booking_url="", enrichment_ts=profile.enriched_at,
+                trace_id=run["trace_id"],
+            )
+
+        contact_id = await loop.run_in_executor(_executor, _hs_sync)
+        lead.hubspot_contact_id = contact_id
+        db.save_lead(lead)
+        s_done("HubSpot Sync", {"contact_id": contact_id})
+
+        run["status"] = "completed"
+        run["result"] = {
+            "lead_id":              lead.lead_id,
+            "status":               "outreach_sent",
+            "send_result":          send_result,
+            "segment":              email_mod.SEGMENT_LABELS[profile.segment],
+            "ai_maturity_score":    profile.ai_maturity_score,
+            "competitor_gap_brief": gap_brief,
+            "hubspot_contact_id":   contact_id,
+        }
+        lf.log_trace("first_contact_complete", {"email": email},
+                     run["result"], session_id=lead.lead_id)
+
+    except Exception as exc:
+        logger.exception("Pipeline failed for %s", email)
+        run["status"] = "failed"
+        run["error"]  = str(exc)
+        for s in run["steps"].values():
+            if s["status"] == "running":
+                s["status"] = "error"
+                s["error"]  = str(exc)
+    finally:
+        run.setdefault("completed_at", time.time())
+        _push_to_history(run)
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+# ── Webhook routes ────────────────────────────────────────────────────────────
+
+@app.post("/webhooks/email")
+@limiter.limit("60/minute")
+async def webhook_email(request: Request):
+    raw_body = await request.body()
+    if not _verify_resend_signature(dict(request.headers), raw_body):
+        return JSONResponse({"error": "invalid signature"}, status_code=401)
+    try:
+        import json as _json
+        body = _json.loads(raw_body)
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    event_type = body.get("type", "")
+    if event_type == "email.bounced":
+        data        = body.get("data", {})
+        to_list     = data.get("to", [])
+        email       = to_list[0] if to_list else ""
+        bounce_info = data.get("bounce", {})
+        bounce_type = bounce_info.get("type", "soft")
+        reason      = bounce_info.get("message", "")
+        trace_id    = lf.log_trace("email_bounced", {"email": email, "type": bounce_type}, None)
+        bounce_result = email_mod.handle_bounce(email, bounce_type, reason, trace_id)
+        if email:
+            hs.mark_bounced(email, bounce_type, trace_id)
+            lead        = db.get_or_create(email)
+            lead.status = "disqualified"
+            db.save_lead(lead)
+        return JSONResponse(bounce_result)
+    if event_type == "email.complained":
+        data    = body.get("data", {})
+        to_list = data.get("to", [])
+        email   = to_list[0] if to_list else ""
+        trace_id = lf.log_trace("email_complaint", {"email": email}, None)
+        complaint_result = email_mod.handle_complaint(email, trace_id)
+        if email:
+            hs.mark_bounced(email, "complaint", trace_id)
+            lead        = db.get_or_create(email)
+            lead.status = "disqualified"
+            db.save_lead(lead)
+        return JSONResponse(complaint_result)
+    email     = body.get("from") or body.get("email", "")
+    text      = body.get("text") or body.get("body", "")
+    thread_id = body.get("thread_id", "")
+    if not email:
+        return JSONResponse({"error": "missing email"}, status_code=400)
+    lead = db.get_or_create(email)
+    if lead.status == "new" or not thread_id:
+        result = _run_full_pipeline(email, text)
     else:
-        from agent import booking_handler
-        return booking_handler.book(email, name, trace_id, key)
-
-
-@app.post("/api/sync-booking/{slug}")
-def sync_booking(slug: str):
-    jf = BASE_DIR / "eval" / "crunchbase-result" / f"{slug}.json"
-    if not jf.exists():
-        return JSONResponse({"success": False, "error": "lead not found"}, status_code=404)
-    data     = json.loads(jf.read_text(encoding="utf-8"))
-    email    = data.get("input", {}).get("contact_email", "")
-    name     = data.get("input", {}).get("name", "")
-    trace_id = data.get("trace_id", str(uuid.uuid4()))
-    result   = _book_calcom(email, name, trace_id)
-    data["booking"] = result
-    jf.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        result = _run_reply_pipeline(email, text)
     return JSONResponse(result)
 
 
-@app.post("/api/sync-crm/{slug}")
-def sync_crm(slug: str):
-    jf = BASE_DIR / "eval" / "crunchbase-result" / f"{slug}.json"
-    if not jf.exists():
-        return JSONResponse({"success": False, "error": "lead not found"}, status_code=404)
-    data      = json.loads(jf.read_text(encoding="utf-8"))
-    email     = data.get("input", {}).get("contact_email", "")
-    name      = data.get("input", {}).get("name", "")
-    enrich    = data.get("enrichment", {})
-    company   = enrich.get("company_name", name)
-    seg       = data.get("segment", {}).get("label", "generic")
-    ai_score  = int(data.get("ai_maturity", {}).get("score", 0) or 0)
-    book_url  = data.get("booking", {}).get("booking_url", "")
-    enrich_ts = enrich.get("enriched_at", "")
-    trace_id  = data.get("trace_id", str(uuid.uuid4()))
-    parts = name.split()
-    first, last = (parts[0], " ".join(parts[1:])) if parts else ("", "")
-    contact_id, hs_error = _hs_upsert_with_error(
-        email, first, last, company, seg, ai_score, book_url, enrich_ts, trace_id
-    )
-    if not contact_id:
-        return JSONResponse({"success": False, "error": hs_error or "HubSpot returned no ID",
-                             "contact_id": ""})
-    data.setdefault("hubspot", {})["contact_id"] = contact_id
-    jf.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    return JSONResponse({"success": True, "contact_id": contact_id})
-
-
-@app.post("/api/sync-booking-db")
-def sync_booking_db(body: _EmailBody):
-    db_path = BASE_DIR / "leads.db"
-    if not db_path.exists():
-        return JSONResponse({"success": False, "error": "no database"})
-    try:
-        from sqlalchemy import create_engine, text as sql
-        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
-        with engine.connect() as conn:
-            row = conn.execute(sql("SELECT * FROM leads WHERE email=:e"), {"e": body.email}).mappings().first()
-        if not row:
-            return JSONResponse({"success": False, "error": "lead not found"})
-        profile  = json.loads(row.get("profile_json") or "{}")
-        company  = profile.get("company_name", body.email.split("@")[0].title())
-        trace_id = row.get("lead_id", str(uuid.uuid4()))
-        result = _book_calcom(body.email, company, trace_id)
-        if result.get("success"):
-            with engine.connect() as conn:
-                conn.execute(
-                    sql("UPDATE leads SET booking_url=:u, updated_at=datetime('now') WHERE email=:e"),
-                    {"u": result["booking_url"], "e": body.email},
-                )
-                conn.commit()
-        return JSONResponse(result)
-    except Exception as exc:
-        return JSONResponse({"success": False, "error": str(exc)})
-
-
-@app.post("/api/sync-crm-db")
-def sync_crm_db(body: _EmailBody):
-    db_path = BASE_DIR / "leads.db"
-    if not db_path.exists():
-        return JSONResponse({"success": False, "error": "no database"})
-    try:
-        from sqlalchemy import create_engine, text as sql
-        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
-        with engine.connect() as conn:
-            row = conn.execute(sql("SELECT * FROM leads WHERE email=:e"), {"e": body.email}).mappings().first()
-        if not row:
-            return JSONResponse({"success": False, "error": "lead not found"})
-        profile   = json.loads(row.get("profile_json") or "{}")
-        name      = profile.get("company_name", "")
-        company   = profile.get("company_name", "")
-        seg       = str(profile.get("segment", "generic"))
-        ai_score  = int(profile.get("ai_maturity_score", 0) or 0)
-        book_url  = row.get("booking_url", "") or ""
-        enrich_ts = profile.get("enriched_at", "")
-        trace_id  = row.get("lead_id", str(uuid.uuid4()))
-        parts = name.split()
-        first, last = (parts[0], " ".join(parts[1:])) if parts else ("", "")
-        contact_id, hs_error = _hs_upsert_with_error(
-            body.email, first, last, company, seg, ai_score, book_url, enrich_ts, trace_id
-        )
-        if not contact_id:
-            return JSONResponse({"success": False,
-                                 "error": hs_error or "HubSpot returned no ID",
-                                 "contact_id": ""})
-        with engine.connect() as conn:
-            conn.execute(
-                sql("UPDATE leads SET hubspot_contact_id=:c, updated_at=datetime('now') WHERE email=:e"),
-                {"c": contact_id, "e": body.email},
-            )
-            conn.commit()
-        return JSONResponse({"success": True, "contact_id": contact_id})
-    except Exception as exc:
-        return JSONResponse({"success": False, "error": str(exc), "contact_id": ""})
-
-
-# ── CSV / live-pipeline ──────────────────────────────────────────────────────
-
-_JOBS: dict = {}
-_JOBS_LOCK  = threading.Lock()
-
-
-class _PipelineBody(BaseModel):
-    rows:  list[dict]
-    limit: int = 10
-
-
-def _hs_upsert_with_error(email, first, last, company, seg, ai, book, ts, trace_id):
-    """Wrapper around hubspot_sync.upsert_contact that surfaces HTTP errors."""
-    import httpx as _hx
-    token = os.getenv("HUBSPOT_ACCESS_TOKEN", "")
-    if not token:
-        return "", "HUBSPOT_ACCESS_TOKEN not set"
-    base    = "https://api.hubapi.com"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    props   = {
-        "email": email, "firstname": first, "lastname": last, "company": company,
-        "hs_lead_status": "IN_PROGRESS",
-        "message": f"segment={seg} | ai_maturity={ai} | booking={book} | enriched={ts}",
-    }
-    try:
-        # Search for existing contact
-        sr = _hx.post(f"{base}/crm/v3/objects/contacts/search", headers=headers,
-                      json={"filterGroups":[{"filters":[{"propertyName":"email",
-                            "operator":"EQ","value":email}]}],"properties":["email"],"limit":1},
-                      timeout=15)
-        existing = (sr.json().get("results") or [{}])[0].get("id") if sr.status_code == 200 else None
-        if existing:
-            r = _hx.patch(f"{base}/crm/v3/objects/contacts/{existing}", headers=headers,
-                          json={"properties": props}, timeout=15)
-        else:
-            r = _hx.post(f"{base}/crm/v3/objects/contacts", headers=headers,
-                         json={"properties": props}, timeout=15)
-        if r.status_code in (200, 201):
-            return r.json().get("id", ""), ""
-        err_body = r.json()
-        return "", f"HTTP {r.status_code}: {err_body.get('message', str(err_body)[:120])}"
-    except Exception as exc:
-        return "", str(exc)[:200]
-
-
-def _run_full_pipeline_row(email: str, name: str, on_step=None) -> dict:
-    """8-step pipeline: Enrich → Signals → Segment → Competitor Gap → Email Compose → Email Send → Booking → CRM."""
-    from agent import enrichment_pipeline as _ep
-    from agent import email_outreach      as _eo
-    from agent import competitor_gap      as _gap
-    from agent import signals_research    as _sr
-    from agent import langfuse_logger     as _lf
-    from agent import db                  as _db
-
-    trace_id = _lf.log_trace("csv_pipeline", {"email": email}, None)
-    steps: list[dict] = []
-
-    def _step(step_name: str, output: dict, error: str = "") -> None:
-        steps.append({
-            "step":   step_name,
-            "status": "error" if error else "done",
-            "output": output,
-            "error":  error,
-            "ts":     time.time(),
-        })
-        if on_step:
-            on_step(step_name)
-
-    # ── Step 1: Enrichment ────────────────────────────────────────────────────
-    profile = None
-    profile_d: dict = {}
-    try:
-        profile   = _ep.enrich(email)
-        profile_d = _dc.asdict(profile)
-        _lf.log_span(trace_id, "enrich", {"email": email}, profile_d)
-        lc = profile.leadership_change
-        _step("Enrichment", {
-            "company_name":          profile.company_name,
-            "domain":                profile.domain,
-            "headcount":             profile.headcount,
-            "funding_stage":         profile.funding_stage,
-            "recently_funded":       profile.recently_funded,
-            "had_layoffs":           profile.had_layoffs,
-            "open_engineering_roles":profile.open_engineering_roles,
-            "ai_maturity_score":     profile.ai_maturity_score,
-            "crunchbase_signal":     profile.crunchbase_signal,
-            "job_posts_signal":      profile.job_posts_signal,
-            "layoffs_signal":        profile.layoffs_signal,
-            "leadership_change_signal": profile.leadership_change_signal,
-            "leadership_change":     _dc.asdict(lc) if lc else None,
-            "enriched_at":           profile.enriched_at,
-        })
-    except Exception as exc:
-        _step("Enrichment", {}, str(exc)[:300])
-        return {"email": email, "company_name": email, "steps": steps, "error": str(exc)[:300]}
-
-    # ── Step 2: Signals Research (Playwright) ─────────────────────────────────
-    company_signals = None
-    try:
-        company_signals = _sr.research(profile.domain, trace_id)
-        profile.signals_research = company_signals.to_dict()
-        _lf.log_span(trace_id, "signals_research", {"domain": profile.domain}, profile.signals_research)
-        _step("Signals Research", {
-            "tagline":             company_signals.tagline,
-            "recent_post":         company_signals.recent_post,
-            "product_hint":        company_signals.product_hint,
-            "tech_hints":          company_signals.tech_hints,
-            "personalization_hook":company_signals.personalization_hook(),
-            "source_urls":         company_signals.source_urls,
-            "error":               company_signals.error,
-        })
-    except Exception as exc:
-        _step("Signals Research", {"error": str(exc)[:200]})
-
-    # ── Step 3: Segment ───────────────────────────────────────────────────────
-    seg_id    = profile.segment
-    seg_label = _eo.SEGMENT_LABELS.get(seg_id, "generic")
-    lc2 = profile.leadership_change
-    _step("Segment", {
-        "segment_id":               seg_id,
-        "segment_label":            seg_label,
-        "ai_maturity_score":        profile.ai_maturity_score,
-        "recently_funded":          profile.recently_funded,
-        "had_layoffs":              profile.had_layoffs,
-        "open_engineering_roles":   profile.open_engineering_roles,
-        "leadership_change_detected": bool(lc2 and lc2.detected),
-    })
-
-    # ── Step 4: Competitor Gap ────────────────────────────────────────────────
-    gap_brief: dict = {}
-    try:
-        gap_brief = _gap.generate_competitor_gap_brief(profile, trace_id)
-        _step("Competitor Gap", gap_brief if isinstance(gap_brief, dict) else {"brief": str(gap_brief)[:500]})
-    except Exception as exc:
-        _step("Competitor Gap", {}, str(exc)[:300])
-
-    # ── Step 5: Email Compose ─────────────────────────────────────────────────
-    subject, body = "", ""
-    det_ok, violations, tone_ok = True, [], True
-    try:
-        subject, body = _eo.compose(profile, trace_id)
-        det_ok, violations = _eo._deterministic_tone_check(subject, body)
-        if not det_ok:
-            subject, body = _eo.compose(profile, trace_id)
-            det_ok, violations = _eo._deterministic_tone_check(subject, body)
-        tone_ok    = _eo.tone_check(subject, body, trace_id)
-        job_conf   = (profile.job_posts_signal or {}).get("confidence", 0.5)
-        cb_conf    = (profile.crunchbase_signal or {}).get("confidence", 0.5)
-        avg_conf   = round((job_conf + cb_conf) / 2, 3)
-        _step("Email Compose", {
-            "subject":              subject,
-            "body":                 body,
-            "det_ok":               det_ok,
-            "violations":           violations,
-            "tone_check":           tone_ok,
-            "signal_confidence_avg":avg_conf,
-        })
-    except Exception as exc:
-        _step("Email Compose", {"subject": subject, "body": body}, str(exc)[:300])
-
-    # ── Step 6: Email Send ────────────────────────────────────────────────────
-    email_sent, email_id, send_error = False, "", ""
-    try:
-        send_result = _eo.send(email, subject, body, trace_id)
-        email_id    = send_result.get("id", "")
-        email_sent  = bool(email_id and "error" not in send_result
-                           and send_result.get("statusCode", 200) < 300)
-        if not email_sent:
-            send_error = (send_result.get("error")
-                          or send_result.get("message")
-                          or f"HTTP {send_result.get('statusCode','?')}")
-        _step("Email Send", {
-            "sent":          email_sent,
-            "resend_id":     email_id,
-            "to":            email,
-            "outbound_live": _eo._OUTBOUND_LIVE,
-            "routed_to":     email if _eo._OUTBOUND_LIVE else _eo._STAFF_SINK,
-            "error":         send_error,
-        })
-    except Exception as exc:
-        send_error = str(exc)[:300]
-        _step("Email Send", {"sent": False, "error": send_error})
-
-    # ── Step 7: Booking ───────────────────────────────────────────────────────
-    booking_result: dict = {"success": False, "booking_url": "", "slot": ""}
-    try:
-        booking_result = _book_calcom(email, name or profile.company_name, trace_id)
-        _step("Booking", {
-            "success":     booking_result.get("success", False),
-            "slot":        booking_result.get("slot", ""),
-            "booking_url": booking_result.get("booking_url", ""),
-            "error":       booking_result.get("error", ""),
-        })
-    except Exception as exc:
-        _step("Booking", {"success": False, "error": str(exc)[:300]})
-
-    # ── Step 8: CRM Sync (HubSpot) ────────────────────────────────────────────
-    parts    = (name or email.split("@")[0]).replace(".", " ").split()
-    first    = parts[0].title() if parts else ""
-    last     = " ".join(parts[1:]).title() if len(parts) > 1 else ""
-    book_url = booking_result.get("booking_url", "")
-    hs_fields = {
-        "email":          email,
-        "firstname":      first,
-        "lastname":       last,
-        "company":        profile.company_name,
-        "hs_lead_status": "IN_PROGRESS",
-        "message":        f"segment={seg_label} | ai_maturity={profile.ai_maturity_score} | booking={book_url}",
-    }
-    contact_id, hs_error = _hs_upsert_with_error(
-        email, first, last, profile.company_name, seg_label,
-        profile.ai_maturity_score, book_url, profile.enriched_at, trace_id,
-    )
-    _step("CRM Sync", {
-        "contact_id": contact_id,
-        "error":      hs_error,
-        "fields":     hs_fields,
-    })
-
-    # ── DB save ───────────────────────────────────────────────────────────────
-    lead                    = _db.get_or_create(email)
-    lead.status             = "outreach_sent"
-    lead.profile            = {**profile_d, "competitor_gap_brief": gap_brief}
-    lead.hubspot_contact_id = contact_id
-    _db.save_lead(lead)
-
-    _lf.log_trace("csv_pipeline_complete", {"email": email}, {"steps": len(steps)},
-                  session_id=lead.lead_id)
-    return {
-        "email":              email,
-        "company_name":       profile.company_name,
-        "segment":            seg_label,
-        "ai_maturity_score":  profile.ai_maturity_score,
-        "email_subject":      subject,
-        "email_body":         body,
-        "email_sent":         email_sent,
-        "email_id":           email_id,
-        "send_error":         send_error,
-        "hubspot_contact_id": contact_id,
-        "hs_error":           hs_error,
-        "gap_angle":          (gap_brief.get("recommended_angle", "")
-                               if isinstance(gap_brief, dict) else ""),
-        "booking_success":    booking_result.get("success", False),
-        "booking_url":        booking_result.get("booking_url", ""),
-        "steps":              steps,
-    }
-
-
-def _run_job(job_id: str) -> None:
-    def _log(msg: str) -> None:
-        with _JOBS_LOCK:
-            _JOBS[job_id]["log"].append({"ts": time.time(), "msg": msg})
-
-    with _JOBS_LOCK:
-        n = len(_JOBS[job_id]["companies"])
-
-    for i in range(n):
-        with _JOBS_LOCK:
-            row   = _JOBS[job_id]["companies"][i]
-            email = row["email"]
-            _JOBS[job_id]["companies"][i]["status"]       = "running"
-            _JOBS[job_id]["companies"][i]["current_step"] = "Starting…"
-        _log(f"⟳  Processing {email}…")
-
-        def _on_step(step_name: str, _i=i) -> None:
-            with _JOBS_LOCK:
-                _JOBS[job_id]["companies"][_i]["current_step"] = step_name
-
-        try:
-            result = _run_full_pipeline_row(email, row.get("name", ""), on_step=_on_step)
-            with _JOBS_LOCK:
-                _JOBS[job_id]["companies"][i]["status"]       = "done"
-                _JOBS[job_id]["companies"][i]["current_step"] = ""
-                _JOBS[job_id]["companies"][i]["result"]       = result
-                _JOBS[job_id]["companies"][i]["steps"]        = result.get("steps", [])
-            cname = result.get("company_name") or email
-            sent  = "email ✓" if result.get("email_sent") else "email ✗"
-            hs    = f"CRM #{result['hubspot_contact_id']}" if result.get("hubspot_contact_id") else "CRM ✗"
-            book  = "booked ✓" if result.get("booking_success") else "booked ✗"
-            _log(f"✓  {cname} — {sent} · {book} · {hs}")
-        except Exception as exc:
-            with _JOBS_LOCK:
-                _JOBS[job_id]["companies"][i]["status"]       = "error"
-                _JOBS[job_id]["companies"][i]["current_step"] = ""
-                _JOBS[job_id]["companies"][i]["error"]        = str(exc)[:300]
-            _log(f"✗  {email} — {str(exc)[:80]}")
-
-    with _JOBS_LOCK:
-        done_n = sum(1 for c in _JOBS[job_id]["companies"] if c["status"] == "done")
-        err_n  = sum(1 for c in _JOBS[job_id]["companies"] if c["status"] == "error")
-        _JOBS[job_id]["status"]      = "done"
-        _JOBS[job_id]["finished_at"] = time.time()
-    _log(f"🏁  Done — {done_n} succeeded, {err_n} failed")
-
-
-@app.post("/api/upload-csv")
-async def upload_csv(file: UploadFile = File(...)):
-    content = await file.read()
-    try:
-        text = content.decode("utf-8-sig")
-    except Exception:
-        text = content.decode("latin-1")
-    reader = csv.DictReader(io.StringIO(text))
-    rows = []
-    for row in reader:
-        norm = {k.strip().lower().replace(" ", "_"): (v or "").strip()
-                for k, v in row.items()}
-        email = (norm.get("email") or norm.get("contact_email")
-                 or norm.get("email_address") or "")
-        if not email and norm.get("domain"):
-            email = f"contact@{norm['domain']}"
-        company = (norm.get("company_name") or norm.get("company")
-                   or norm.get("organization") or "")
-        name    = (norm.get("contact_name") or norm.get("name")
-                   or norm.get("first_name") or "")
-        rows.append({"email": email, "company": company, "name": name})
-    return JSONResponse(rows[:500])
-
-
-@app.get("/api/debug-hubspot")
-def debug_hubspot():
-    import httpx as _hx
-    token = os.getenv("HUBSPOT_ACCESS_TOKEN", "")
-    if not token:
-        return JSONResponse({"error": "HUBSPOT_ACCESS_TOKEN not set"})
-    base    = "https://api.hubapi.com"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    try:
-        r = _hx.get(f"{base}/crm/v3/objects/contacts?limit=1", headers=headers, timeout=10)
+@app.post("/webhooks/sms")
+@limiter.limit("60/minute")
+async def webhook_sms(request: Request):
+    content_type = request.headers.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        form = await request.form()
+        raw  = dict(form)
+    else:
+        raw = await request.json()
+    if not _verify_at_webhook(raw):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    parsed    = sms_mod.parse_at_payload(raw)
+    phone     = parsed["phone"]
+    text      = parsed["text"]
+    if not phone:
+        return JSONResponse({"error": "missing phone"}, status_code=400)
+    trace_id  = lf.log_trace("sms_inbound", {"phone": phone, "text": text}, None)
+    warm_lead = db.get_by_phone(phone)
+    if warm_lead is None:
         return JSONResponse({
-            "status":      r.status_code,
-            "token_prefix": token[:12] + "…",
-            "response":    r.json(),
-            "ok":          r.status_code == 200,
-        })
+            "routed": False, "reason": "channel_hierarchy_gate",
+            "detail": "No warm lead for this phone. First contact must be via email.",
+        }, status_code=200)
+    result = sms_mod.handle_inbound_sms(
+        phone=phone, text=text, lead_status=warm_lead.status, trace_id=trace_id,
+        reply_pipeline_fn=lambda _p, _t: _run_reply_pipeline(warm_lead.email, _t),
+    )
+    lf.log_trace("sms_complete", {"phone": phone}, result, session_id=warm_lead.lead_id)
+    return JSONResponse(result)
+
+
+@app.post("/simulate")
+async def simulate(request: Request):
+    body  = await request.json()
+    email = body.get("email", "prospect@example.com")
+    text  = body.get("text", "Tell me more about your engineering teams.")
+    return JSONResponse(_run_full_pipeline(email, text))
+
+
+@app.post("/simulate/sms")
+async def simulate_sms(request: Request):
+    body  = await request.json()
+    email = body.get("email", "")
+    phone = body.get("phone", "")
+    text  = body.get("text", "Yes, let's talk.")
+    if not email or not phone:
+        return JSONResponse({"error": "email and phone required"}, status_code=400)
+    db.link_phone(email, phone)
+    raw      = {"from": phone, "text": text, "to": "Sandbox", "username": _AT_USERNAME}
+    parsed   = sms_mod.parse_at_payload(raw)
+    trace_id = lf.log_trace("sms_simulate", {"email": email, "phone": phone}, None)
+    warm_lead = db.get_by_phone(phone)
+    if warm_lead is None:
+        return JSONResponse({"error": "lead not found after link_phone"}, status_code=500)
+    result = sms_mod.handle_inbound_sms(
+        phone=phone, text=parsed["text"], lead_status=warm_lead.status, trace_id=trace_id,
+        reply_pipeline_fn=lambda _p, _t: _run_reply_pipeline(warm_lead.email, _t),
+    )
+    return JSONResponse(result)
+
+
+# ── Pipeline API ──────────────────────────────────────────────────────────────
+
+@app.get("/api/pipeline/history")
+async def api_pipeline_history():
+    return JSONResponse(_RUN_HISTORY)
+
+
+@app.post("/api/pipeline/run")
+async def api_pipeline_run(request: Request):
+    body  = await request.json()
+    email = body.get("email", "").strip()
+    text  = body.get("text", "").strip()
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    run_id = str(uuid.uuid4())
+    run = {
+        "run_id": run_id, "email": email, "text": text,
+        "status": "pending",
+        "steps": {}, "step_order": [],
+        "email_draft": None, "profile": None, "gap_brief": None,
+        "trace_id": None, "result": None, "error": None,
+        "started_at": time.time(), "completed_at": None,
+    }
+    _RUN_STORE[run_id] = run
+    task = asyncio.create_task(_pipeline_task(run_id))
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return JSONResponse({"run_id": run_id})
+
+
+@app.get("/api/pipeline/{run_id}")
+async def api_pipeline_status(run_id: str):
+    run = _RUN_STORE.get(run_id)
+    if not run:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({
+        "run_id":       run["run_id"],
+        "email":        run["email"],
+        "status":       run["status"],
+        "steps":        run["steps"],
+        "step_order":   run["step_order"],
+        "email_draft":  run["email_draft"],
+        "result":       run.get("result"),
+        "error":        run.get("error"),
+        "started_at":   run["started_at"],
+        "completed_at": run.get("completed_at"),
+    })
+
+
+@app.post("/api/pipeline/{run_id}/approve")
+async def api_pipeline_approve(run_id: str, request: Request):
+    run = _RUN_STORE.get(run_id)
+    if not run:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if run["status"] != "awaiting_approval":
+        return JSONResponse({"error": "not awaiting approval"}, status_code=400)
+    body = await request.json()
+    if run["email_draft"]:
+        if "subject" in body:
+            run["email_draft"]["subject"] = body["subject"]
+        if "body" in body:
+            run["email_draft"]["body"] = body["body"]
+    run["status"] = "approved"
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/pipeline/{run_id}/reject")
+async def api_pipeline_reject(run_id: str):
+    run = _RUN_STORE.get(run_id)
+    if not run:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    run["status"] = "rejected"
+    return JSONResponse({"ok": True})
+
+
+# ── Email API ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/email/compose")
+async def api_email_compose(request: Request):
+    body  = await request.json()
+    email = body.get("email", "").strip()
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    loop     = asyncio.get_running_loop()
+    trace_id = lf.log_trace("compose_only", {"email": email}, None)
+    profile  = await loop.run_in_executor(_executor, enrich_mod.enrich, email)
+    subject, body_text = await loop.run_in_executor(_executor, email_mod.compose, profile, trace_id)
+    return JSONResponse({
+        "to":       email,
+        "subject":  subject,
+        "body":     body_text,
+        "trace_id": trace_id,
+        "company":  profile.company_name,
+        "segment":  email_mod.SEGMENT_LABELS.get(profile.segment, "generic"),
+    })
+
+
+@app.post("/api/email/send")
+async def api_email_send(request: Request):
+    body      = await request.json()
+    to        = body.get("to", "").strip()
+    subject   = body.get("subject", "").strip()
+    body_text = body.get("body", "").strip()
+    trace_id  = body.get("trace_id", f"manual-{int(time.time())}")
+    if not (to and subject and body_text):
+        return JSONResponse({"error": "to, subject, body required"}, status_code=400)
+    loop   = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_executor, email_mod.send, to, subject, body_text, trace_id)
+    return JSONResponse(result)
+
+
+# ── Gap API ───────────────────────────────────────────────────────────────────
+
+@app.post("/api/gap/analyze")
+async def api_gap_analyze(request: Request):
+    body  = await request.json()
+    email = body.get("email", "").strip()
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    loop             = asyncio.get_running_loop()
+    trace_id         = lf.log_trace("gap_only", {"email": email}, None)
+    profile          = await loop.run_in_executor(_executor, enrich_mod.enrich, email)
+    company_signals  = await loop.run_in_executor(_executor, signals_mod.research, profile.domain, trace_id)
+    profile.signals_research = company_signals.to_dict()
+    gap_brief        = await loop.run_in_executor(
+        _executor, gap_mod.generate_competitor_gap_brief, profile, trace_id
+    )
+    return JSONResponse({
+        "gap_brief": gap_brief,
+        "company":   profile.company_name,
+        "domain":    profile.domain,
+        "segment":   email_mod.SEGMENT_LABELS.get(profile.segment, "generic"),
+    })
+
+
+# ── CRM API ───────────────────────────────────────────────────────────────────
+
+@app.post("/api/crm/sync")
+async def api_crm_sync(request: Request):
+    body  = await request.json()
+    email = body.get("email", "").strip()
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    lead       = db.get_or_create(email)
+    profile    = lead.profile or {}
+    name_parts = email.split("@")[0].split(".")
+    first      = name_parts[0].title()
+    last       = name_parts[1].title() if len(name_parts) > 1 else ""
+    loop       = asyncio.get_running_loop()
+    trace_id   = lf.log_trace("crm_sync_manual", {"email": email}, None)
+
+    def _sync():
+        return hs.upsert_contact(
+            email=email, first_name=first, last_name=last,
+            company=profile.get("company_name", ""),
+            segment_label=email_mod.SEGMENT_LABELS.get(profile.get("segment", 0), "generic"),
+            ai_maturity_score=profile.get("ai_maturity_score", 0),
+            booking_url=lead.booking_url or "",
+            enrichment_ts=profile.get("enriched_at", ""),
+            trace_id=trace_id,
+        )
+
+    contact_id = await loop.run_in_executor(_executor, _sync)
+    lead.hubspot_contact_id = contact_id
+    db.save_lead(lead)
+    return JSONResponse({"ok": True, "contact_id": contact_id, "email": email})
+
+
+# ── Batch API ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/batch/parse")
+async def api_batch_parse(request: Request):
+    form = await request.form()
+    upload = form.get("file")
+    if not upload:
+        return JSONResponse({"error": "file required"}, status_code=400)
+    filename = (upload.filename or "").lower()
+    content  = await upload.read()
+    try:
+        if filename.endswith(".csv"):
+            leads = _parse_csv_bytes(content)
+        elif filename.endswith(".pdf"):
+            leads = _parse_pdf_bytes(content)
+        elif filename.endswith(".docx"):
+            leads = _parse_docx_bytes(content)
+        else:
+            return JSONResponse({"error": "Unsupported file. Use .csv, .pdf or .docx"}, status_code=400)
     except Exception as exc:
-        return JSONResponse({"error": str(exc)})
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return JSONResponse({"count": len(leads), "leads": leads})
 
 
-@app.post("/api/start-pipeline")
-def start_pipeline(body: _PipelineBody):
-    job_id    = str(uuid.uuid4())
-    seen      = set()
-    companies = []
-    for row in body.rows[: body.limit]:
-        email = (row.get("email") or "").strip()
-        if not email or email in seen:
-            continue
-        seen.add(email)
-        companies.append({
-            "email":        email,
-            "company":      row.get("company", ""),
-            "name":         row.get("name", ""),
-            "status":       "pending",
-            "result":       None,
-            "error":        "",
-            "current_step": "",
-            "steps":        [],
-        })
-    with _JOBS_LOCK:
-        # Remove old completed jobs to keep memory clean; keep only running ones
-        stale = [k for k, v in _JOBS.items() if v["status"] == "done"]
-        for k in stale:
-            del _JOBS[k]
-        _JOBS[job_id] = {
-            "status":      "running",
-            "companies":   companies,
-            "started_at":  time.time(),
-            "finished_at": None,
-            "log":         [],
-        }
-    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return JSONResponse({"job_id": job_id, "count": len(companies)})
+async def _batch_task(leads: list[dict]) -> None:
+    global _BATCH
+    _BATCH.update({
+        "status": "running", "total": len(leads), "done": 0,
+        "failed_count": 0, "current": None, "results": [],
+        "started_at": time.time(), "completed_at": None,
+    })
+    loop = asyncio.get_running_loop()
+    for lead in leads:
+        email = lead["email"]
+        _BATCH["current"] = email
+        try:
+            result = await loop.run_in_executor(
+                _executor, _run_full_pipeline, email, ""
+            )
+            _BATCH["results"].append({"email": email, "status": "ok", "result": result})
+            _BATCH["done"] += 1
+        except Exception as exc:
+            logger.exception("Batch pipeline failed for %s", email)
+            _BATCH["results"].append({"email": email, "status": "error", "error": str(exc)})
+            _BATCH["failed_count"] += 1
+    _BATCH["status"]       = "completed"
+    _BATCH["current"]      = None
+    _BATCH["completed_at"] = time.time()
 
 
-@app.get("/api/pipeline-status/{job_id}")
-def pipeline_status(job_id: str):
-    with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-    if not job:
-        return JSONResponse({"error": "job not found"}, status_code=404)
-    return JSONResponse(dict(job))
+@app.post("/api/batch/run")
+async def api_batch_run(request: Request):
+    if _BATCH["status"] == "running":
+        return JSONResponse({"error": "A batch is already running"}, status_code=409)
+    body  = await request.json()
+    leads = body.get("leads", [])
+    n     = int(body.get("n", len(leads)))
+    if not leads:
+        return JSONResponse({"error": "leads list required"}, status_code=400)
+    subset = leads[:n]
+    task = asyncio.create_task(_batch_task(subset))
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return JSONResponse({"ok": True, "queued": len(subset)})
 
 
-@app.get("/api/pipeline-jobs")
-def pipeline_jobs():
-    with _JOBS_LOCK:
-        summary = [
-            {
-                "job_id":     k,
-                "status":     v["status"],
-                "total":      len(v["companies"]),
-                "done":       sum(1 for c in v["companies"] if c["status"] == "done"),
-                "errors":     sum(1 for c in v["companies"] if c["status"] == "error"),
-                "started_at": v["started_at"],
-            }
-            for k, v in _JOBS.items()
-        ]
-    return JSONResponse(sorted(summary, key=lambda x: -x["started_at"])[:20])
+@app.get("/api/batch/status")
+async def api_batch_status():
+    return JSONResponse({k: v for k, v in _BATCH.items() if k != "results"} |
+                        {"result_count": len(_BATCH["results"]),
+                         "latest_results": _BATCH["results"][-10:]})
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard():
-    return HTML
+# ── Leads API ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/leads")
+async def api_leads():
+    leads = db.list_all()
+    return JSONResponse([_lead_to_dict(l) for l in leads])
 
 
-HTML = r"""<!DOCTYPE html>
+@app.get("/api/leads/{email_b64}")
+async def api_lead_detail(email_b64: str):
+    email = base64.urlsafe_b64decode(email_b64 + "==").decode()
+    lead  = db.get_or_create(email)
+    return JSONResponse(_lead_to_dict(lead))
+
+
+@app.delete("/api/leads/{email_b64}")
+async def api_delete_lead(email_b64: str):
+    email   = base64.urlsafe_b64decode(email_b64 + "==").decode()
+    deleted = db.delete_lead(email)
+    return JSONResponse({"deleted": deleted, "email": email})
+
+
+def _lead_to_dict(lead) -> dict:
+    profile = lead.profile or {}
+    return {
+        "email":              lead.email,
+        "lead_id":            lead.lead_id,
+        "phone":              lead.phone,
+        "status":             lead.status,
+        "turns":              lead.turns,
+        "created_at":         lead.created_at,
+        "booking_url":        lead.booking_url,
+        "hubspot_contact_id": lead.hubspot_contact_id,
+        "company_name":       profile.get("company_name", ""),
+        "domain":             profile.get("domain", ""),
+        "segment":            profile.get("segment", 0),
+        "segment_label":      email_mod.SEGMENT_LABELS.get(profile.get("segment", 0), "generic"),
+        "ai_maturity_score":  profile.get("ai_maturity_score", 0),
+        "enriched_at":        profile.get("enriched_at", ""),
+        "history":            lead.history,
+        "profile":            profile,
+    }
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
+
+_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tenacious · Conversion Dashboard</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<title>Tenacious Conversion Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
-[x-cloak]{display:none!important}
-.bubble-agent{background:#052e16;border-left:3px solid #22c55e}
-.bubble-prospect{background:#0f172a;border-left:3px solid #3b82f6}
-.bar{transition:width .5s ease}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:#111827}
-::-webkit-scrollbar-thumb{background:#374151;border-radius:3px}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:           #f1f5f9;
+  --surface:      #ffffff;
+  --surface-2:    #f8fafc;
+  --border:       #e2e8f0;
+  --border-2:     #cbd5e1;
+  --text:         #0f172a;
+  --text-2:       #334155;
+  --muted:        #64748b;
+  --accent:       #7c3aed;
+  --accent-h:     #6d28d9;
+  --accent-light: #ede9fe;
+  --green:        #16a34a;
+  --green-l:      #dcfce7;
+  --yellow:       #d97706;
+  --yellow-l:     #fef3c7;
+  --red:          #dc2626;
+  --red-l:        #fee2e2;
+  --blue:         #2563eb;
+  --blue-l:       #dbeafe;
+  --radius:       10px;
+  --topbar-h:     56px;
+  --sidebar-w:    310px;
+  --shadow:       0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.05);
+  --shadow-md:    0 4px 6px -1px rgba(0,0,0,.07),0 2px 4px -1px rgba(0,0,0,.05);
+  --shadow-lg:    0 10px 15px -3px rgba(0,0,0,.08),0 4px 6px -2px rgba(0,0,0,.05);
+}
+
+body { font-family:'Inter',sans-serif; background:var(--bg); color:var(--text);
+       min-height:100vh; font-size:14px; line-height:1.5; }
+
+/* ── Topbar ── */
+.topbar { height:var(--topbar-h); display:flex; align-items:center;
+          justify-content:space-between; padding:0 24px;
+          background:var(--surface); border-bottom:1px solid var(--border);
+          position:sticky; top:0; z-index:200; box-shadow:var(--shadow); }
+.logo { font-size:15px; font-weight:700; letter-spacing:-.3px; color:var(--text); }
+.logo span { color:var(--accent); }
+.topbar-right { display:flex; align-items:center; gap:14px; }
+.health-pill { display:flex; align-items:center; gap:6px; padding:4px 10px;
+               border-radius:99px; background:var(--surface-2);
+               border:1px solid var(--border); font-size:12px; color:var(--muted); }
+.hdot { width:7px; height:7px; border-radius:50%; background:#94a3b8;
+        transition:background .3s; }
+.hdot.ok { background:var(--green); box-shadow:0 0 5px rgba(22,163,74,.4); }
+.outbound-badge { font-size:11px; padding:3px 8px; border-radius:99px; font-weight:600; }
+.outbound-live { background:var(--green-l); color:var(--green); }
+.outbound-sink { background:var(--yellow-l); color:var(--yellow); }
+
+/* ── Layout ── */
+.layout { display:flex; min-height:calc(100vh - var(--topbar-h)); align-items:flex-start; }
+.main-area { flex:1; min-width:0; padding:24px; }
+.sidebar { width:var(--sidebar-w); flex-shrink:0; border-left:1px solid var(--border);
+           background:var(--surface); padding:16px;
+           position:sticky; top:var(--topbar-h);
+           height:calc(100vh - var(--topbar-h)); overflow-y:auto; }
+
+/* ── Stats ── */
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+         gap:10px; margin-bottom:20px; }
+.stat-card { background:var(--surface); border:1px solid var(--border);
+             border-radius:var(--radius); padding:14px 16px; box-shadow:var(--shadow); }
+.stat-num { font-size:26px; font-weight:700; line-height:1; }
+.stat-lbl { font-size:11px; color:var(--muted); text-transform:uppercase;
+            letter-spacing:.6px; font-weight:500; margin-top:3px; }
+.c-all  { color:var(--text); }
+.c-new  { color:var(--muted); }
+.c-sent { color:var(--blue); }
+.c-conv { color:var(--yellow); }
+.c-qual { color:var(--green); }
+.c-disq { color:var(--red); }
+
+/* ── Panel ── */
+.panel { background:var(--surface); border:1px solid var(--border);
+         border-radius:var(--radius); margin-bottom:16px;
+         box-shadow:var(--shadow); overflow:hidden; }
+.panel-head { display:flex; align-items:center; justify-content:space-between;
+              padding:13px 18px; cursor:pointer; user-select:none;
+              border-bottom:1px solid transparent; }
+.panel-head:hover { background:var(--surface-2); }
+.panel-head.open { border-bottom-color:var(--border); }
+.panel-title { font-size:13px; font-weight:600; color:var(--text);
+               display:flex; align-items:center; gap:8px; }
+.panel-icon { font-size:15px; }
+.chevron { font-size:10px; color:var(--muted); transition:transform .2s; }
+.panel-head.open .chevron { transform:rotate(180deg); }
+.panel-body { padding:18px; display:none; }
+.panel-body.open { display:block; }
+
+/* ── Forms ── */
+.form-row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px; }
+.field { display:flex; flex-direction:column; gap:5px; flex:1; min-width:180px; }
+label { font-size:11px; font-weight:600; color:var(--muted);
+        text-transform:uppercase; letter-spacing:.5px; }
+input, textarea, select {
+  background:var(--surface-2); border:1px solid var(--border-2);
+  color:var(--text); border-radius:7px; padding:8px 12px;
+  font-family:inherit; font-size:13px; outline:none;
+  transition:border-color .15s, box-shadow .15s; width:100%; }
+input:focus, textarea:focus, select:focus {
+  border-color:var(--accent); box-shadow:0 0 0 3px rgba(124,58,237,.1); }
+textarea { resize:vertical; min-height:80px; }
+select { cursor:pointer; }
+
+.btn { padding:8px 16px; border-radius:7px; border:none; cursor:pointer;
+       font-family:inherit; font-size:13px; font-weight:600;
+       transition:opacity .15s,transform .1s,box-shadow .15s; white-space:nowrap;
+       display:inline-flex; align-items:center; gap:6px; }
+.btn:active { transform:scale(.97); }
+.btn:disabled { opacity:.45; cursor:not-allowed; }
+.btn-primary { background:var(--accent); color:#fff; box-shadow:0 1px 3px rgba(124,58,237,.3); }
+.btn-primary:hover:not(:disabled) { background:var(--accent-h); box-shadow:0 2px 6px rgba(124,58,237,.4); }
+.btn-success { background:var(--green); color:#fff; }
+.btn-success:hover:not(:disabled) { opacity:.88; }
+.btn-danger  { background:var(--red-l); color:var(--red); border:1px solid rgba(220,38,38,.25); }
+.btn-danger:hover:not(:disabled)  { background:rgba(220,38,38,.2); }
+.btn-ghost   { background:transparent; color:var(--muted);
+               border:1px solid var(--border-2); }
+.btn-ghost:hover { color:var(--text); border-color:var(--border-2); background:var(--surface-2); }
+.btn-sm { padding:5px 10px; font-size:12px; }
+
+/* ── Spinner ── */
+.spin { display:inline-block; animation:spin .7s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.btn-spinner { width:13px; height:13px; border:2px solid rgba(255,255,255,.35);
+               border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+
+/* ── Result box ── */
+.result-box { background:var(--surface-2); border:1px solid var(--border);
+              border-radius:7px; padding:14px; font-family:'Menlo','Consolas',monospace;
+              font-size:12px; color:var(--text-2); white-space:pre-wrap; word-break:break-all;
+              max-height:260px; overflow-y:auto; margin-top:12px; display:none; }
+.result-box.visible { display:block; }
+.result-box.error { border-color:rgba(220,38,38,.35); color:var(--red); }
+
+/* ── Pipeline steps ── */
+.pipe-form { margin-bottom:16px; }
+.progress-wrap { margin:14px 0 6px; }
+.progress-label { display:flex; justify-content:space-between;
+                  font-size:11px; color:var(--muted); margin-bottom:5px; font-weight:500; }
+.progress-track { width:100%; height:7px; background:var(--border);
+                  border-radius:99px; overflow:hidden; }
+.progress-fill  { height:100%; background:linear-gradient(90deg,var(--accent),#a855f7);
+                  border-radius:99px; transition:width .6s cubic-bezier(.4,0,.2,1); width:0%; }
+.steps-list { display:flex; flex-direction:column; gap:6px; }
+.step-card { display:flex; align-items:center; gap:12px; padding:10px 14px;
+             border-radius:8px; border:1px solid var(--border);
+             background:var(--surface-2); transition:all .25s; }
+.step-card.s-running  { border-color:#93c5fd; background:var(--blue-l); }
+.step-card.s-done     { border-color:#86efac; background:var(--green-l); }
+.step-card.s-error    { border-color:#fca5a5; background:var(--red-l); }
+.step-card.s-awaiting { border-color:#fcd34d; background:var(--yellow-l); }
+.step-card.s-rejected { border-color:#fca5a5; background:var(--red-l); opacity:.7; }
+.step-card.s-pending  { opacity:.5; }
+.step-icon-wrap { width:26px; height:26px; border-radius:50%; display:flex;
+                  align-items:center; justify-content:center; font-size:13px;
+                  font-weight:700; flex-shrink:0; }
+.step-icon-wrap.s-pending  { background:#e2e8f0; color:#94a3b8; }
+.step-icon-wrap.s-running  { background:var(--blue); color:#fff; }
+.step-icon-wrap.s-done     { background:var(--green); color:#fff; }
+.step-icon-wrap.s-error    { background:var(--red); color:#fff; }
+.step-icon-wrap.s-awaiting { background:var(--yellow); color:#fff; }
+.step-icon-wrap.s-rejected { background:var(--red); color:#fff; }
+.step-content { flex:1; min-width:0; }
+.step-name { font-size:13px; font-weight:600; color:var(--text); }
+.step-detail { font-size:11px; color:var(--muted); margin-top:2px;
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.step-badge { font-size:10px; font-weight:700; padding:2px 8px; border-radius:99px;
+              text-transform:uppercase; letter-spacing:.5px; flex-shrink:0; }
+.step-badge.s-pending  { background:#e2e8f0; color:#94a3b8; }
+.step-badge.s-running  { background:var(--blue-l); color:var(--blue); }
+.step-badge.s-done     { background:var(--green-l); color:var(--green); }
+.step-badge.s-error    { background:var(--red-l); color:var(--red); }
+.step-badge.s-awaiting { background:var(--yellow-l); color:var(--yellow); }
+.step-badge.s-rejected { background:var(--red-l); color:var(--red); }
+.pipe-status-msg { font-size:13px; color:var(--muted); margin-top:12px;
+                   font-weight:500; text-align:center; }
+
+/* ── Table ── */
+.tbl-wrap { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; }
+th { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase;
+     letter-spacing:.5px; padding:10px 14px; text-align:left;
+     border-bottom:1px solid var(--border); white-space:nowrap;
+     background:var(--surface-2); }
+td { padding:11px 14px; border-bottom:1px solid var(--border);
+     vertical-align:middle; font-size:13px; }
+tr:last-child td { border-bottom:none; }
+tbody tr { cursor:pointer; transition:background .1s; }
+tbody tr:hover { background:var(--surface-2); }
+.email-cell { font-family:'Menlo','Consolas',monospace; font-size:12px; color:var(--accent); }
+.company-cell { font-weight:500; }
+.empty-state { text-align:center; padding:40px; color:var(--muted); font-size:13px; }
+
+/* ── Badges ── */
+.badge { display:inline-flex; align-items:center; padding:3px 9px; border-radius:99px;
+         font-size:11px; font-weight:600; white-space:nowrap; }
+.badge-new  { background:#f1f5f9; color:#64748b; }
+.badge-sent { background:var(--blue-l); color:var(--blue); }
+.badge-conv { background:var(--yellow-l); color:var(--yellow); }
+.badge-qual { background:var(--green-l); color:var(--green); }
+.badge-disq { background:var(--red-l); color:var(--red); }
+.score { display:inline-flex; align-items:center; gap:4px; }
+.score-dot { width:7px; height:7px; border-radius:50%; }
+.s0{background:#94a3b8} .s1{background:#22c55e} .s2{background:#f59e0b}
+.s3{background:#f97316} .s4{background:#ef4444}
+
+/* ── Toolbar ── */
+.toolbar { display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap; }
+.search-input { flex:1; min-width:180px; }
+
+/* ── Sidebar ── */
+.sidebar-title { font-size:12px; font-weight:700; text-transform:uppercase;
+                 letter-spacing:.6px; color:var(--muted); margin-bottom:12px;
+                 padding-bottom:10px; border-bottom:1px solid var(--border); }
+.run-card { border:1px solid var(--border); border-radius:8px; margin-bottom:8px;
+            background:var(--surface-2); cursor:pointer; overflow:hidden;
+            transition:box-shadow .15s; }
+.run-card:hover { box-shadow:var(--shadow-md); }
+.run-card-head { padding:10px 12px; }
+.run-email { font-size:12px; font-family:'Menlo','Consolas',monospace;
+             color:var(--accent); font-weight:500; margin-bottom:3px;
+             overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.run-meta { display:flex; align-items:center; justify-content:space-between; }
+.run-time { font-size:11px; color:var(--muted); }
+.run-status-pill { font-size:10px; font-weight:700; padding:2px 7px;
+                   border-radius:99px; text-transform:uppercase; letter-spacing:.4px; }
+.rp-completed { background:var(--green-l); color:var(--green); }
+.rp-failed    { background:var(--red-l); color:var(--red); }
+.rp-rejected  { background:#f1f5f9; color:var(--muted); }
+.rp-running   { background:var(--blue-l); color:var(--blue); }
+.rp-awaiting  { background:var(--yellow-l); color:var(--yellow); }
+.rp-pending   { background:#f1f5f9; color:var(--muted); }
+.run-detail   { padding:0 12px 10px; display:none; border-top:1px solid var(--border);
+                margin-top:2px; padding-top:8px; }
+.run-detail.open { display:block; }
+.run-result-pre { font-family:'Menlo','Consolas',monospace; font-size:10px;
+                  color:var(--text-2); white-space:pre-wrap; word-break:break-all;
+                  max-height:140px; overflow-y:auto; }
+.run-gap-preview { font-size:11px; color:var(--muted); margin-top:6px;
+                   font-style:italic; }
+.run-error-msg { font-size:11px; color:var(--red); margin-top:4px; }
+.sidebar-empty { text-align:center; padding:32px 8px; color:var(--muted); font-size:12px; }
+
+/* ── Overlays / Modals ── */
+.overlay { position:fixed; inset:0; background:rgba(15,23,42,.5); z-index:300;
+           display:none; align-items:center; justify-content:center; padding:20px; }
+.overlay.open { display:flex; }
+.modal { background:var(--surface); border:1px solid var(--border-2);
+         border-radius:14px; width:100%; max-width:640px; max-height:90vh;
+         overflow-y:auto; box-shadow:var(--shadow-lg);
+         animation:fadeUp .2s ease; }
+.modal-lg { max-width:740px; }
+@keyframes fadeUp { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+.modal-head { padding:18px 22px 14px; border-bottom:1px solid var(--border);
+              display:flex; align-items:flex-start; justify-content:space-between; }
+.modal-head h3 { font-size:15px; font-weight:700; }
+.modal-head .sub { font-size:12px; color:var(--muted); margin-top:2px; }
+.close-btn { background:none; border:none; color:var(--muted); font-size:18px;
+             cursor:pointer; padding:0 4px; line-height:1; border-radius:4px; }
+.close-btn:hover { color:var(--text); background:var(--surface-2); }
+.modal-body { padding:20px 22px; }
+.modal-footer { display:flex; gap:10px; justify-content:flex-end;
+                padding:14px 22px; border-top:1px solid var(--border);
+                background:var(--surface-2); border-radius:0 0 14px 14px; }
+
+/* ── Email approval modal specifics ── */
+.approval-to-row { display:flex; align-items:center; gap:8px; padding:10px 12px;
+                   background:var(--surface-2); border:1px solid var(--border);
+                   border-radius:7px; margin-bottom:12px; }
+.approval-to-label { font-size:11px; font-weight:700; color:var(--muted);
+                     text-transform:uppercase; letter-spacing:.5px; white-space:nowrap; }
+.approval-to-email { font-size:13px; font-family:'Menlo','Consolas',monospace;
+                     color:var(--accent); font-weight:500; }
+.sink-note { font-size:11px; color:var(--yellow); font-weight:500;
+             margin-left:auto; background:var(--yellow-l); padding:2px 8px;
+             border-radius:99px; white-space:nowrap; }
+.approval-hint { font-size:12px; color:var(--muted); margin-bottom:16px;
+                 padding:8px 12px; background:var(--accent-light);
+                 border-radius:7px; border-left:3px solid var(--accent); }
+
+/* ── Lead detail modal ── */
+.kv-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }
+.kv .k  { font-size:11px; color:var(--muted); text-transform:uppercase;
+           letter-spacing:.5px; margin-bottom:2px; font-weight:600; }
+.kv .v  { font-size:13px; font-weight:500; word-break:break-all; }
+.section-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase;
+                 letter-spacing:.6px; margin:16px 0 8px; border-top:1px solid var(--border);
+                 padding-top:14px; }
+.history-item { background:var(--surface-2); border:1px solid var(--border);
+                border-radius:7px; padding:10px 12px; margin-bottom:6px; }
+.history-item .role { font-size:10px; font-weight:700; text-transform:uppercase;
+                      letter-spacing:.5px; margin-bottom:3px; }
+.role-user      { color:var(--blue); }
+.role-assistant { color:var(--accent); }
+.history-item .msg { font-size:12px; color:var(--text-2); line-height:1.5; }
+.json-block { background:var(--surface-2); border:1px solid var(--border); border-radius:7px;
+              padding:10px; font-family:monospace; font-size:11px; color:var(--muted);
+              white-space:pre-wrap; word-break:break-all; max-height:160px; overflow-y:auto; }
+
+/* ── Info block (Resend guide) ── */
+.info-block { background:var(--surface-2); border:1px solid var(--border);
+              border-radius:8px; padding:14px 16px; font-size:13px; color:var(--text-2);
+              line-height:1.7; }
+.info-block h4 { font-size:13px; font-weight:700; color:var(--text); margin-bottom:8px; }
+.info-block code { background:var(--accent-light); color:var(--accent); padding:1px 5px;
+                   border-radius:4px; font-family:'Menlo','Consolas',monospace; font-size:12px; }
+.info-block ol, .info-block ul { padding-left:20px; }
+.info-block li { margin-bottom:4px; }
+
+/* ── Batch upload ── */
+.upload-zone { border:2px dashed var(--border-2); border-radius:10px;
+               padding:32px 20px; text-align:center; cursor:pointer;
+               transition:border-color .2s,background .2s; background:var(--surface-2); }
+.upload-zone:hover,.upload-zone.drag-over { border-color:var(--accent);
+               background:var(--accent-light); }
+.upload-icon { font-size:32px; margin-bottom:8px; }
+.upload-label { font-size:14px; font-weight:600; color:var(--text-2); margin-bottom:4px; }
+.upload-hint  { font-size:12px; color:var(--muted); }
+.batch-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+                  margin-bottom:14px; padding:12px 14px; background:var(--surface-2);
+                  border:1px solid var(--border); border-radius:8px; }
+.batch-controls .field { min-width:120px; flex:0 0 auto; }
+.batch-count-badge { font-size:13px; font-weight:600; color:var(--accent);
+                     background:var(--accent-light); padding:4px 12px;
+                     border-radius:99px; white-space:nowrap; }
+.checkbox-row { display:flex; align-items:center; gap:6px; font-size:13px;
+                color:var(--text-2); cursor:pointer; user-select:none; }
+.checkbox-row input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); }
+.batch-table th, .batch-table td { padding:8px 12px; }
+.batch-table .num-cell { color:var(--muted); font-size:12px; text-align:center; width:40px; }
+.batch-progress-wrap { margin-top:16px; }
+.batch-item { display:flex; align-items:center; gap:10px; padding:7px 12px;
+              border-radius:7px; border:1px solid var(--border);
+              background:var(--surface-2); margin-bottom:5px; font-size:13px; }
+.batch-item .bi-email { font-family:'Menlo','Consolas',monospace; font-size:12px;
+                         color:var(--accent); flex:1; min-width:0;
+                         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.batch-item .bi-status { font-size:11px; font-weight:700; padding:2px 8px;
+                          border-radius:99px; white-space:nowrap; }
+.bi-ok      { background:var(--green-l); color:var(--green); }
+.bi-error   { background:var(--red-l);   color:var(--red); }
+.bi-running { background:var(--blue-l);  color:var(--blue); }
+.bi-pending { background:#f1f5f9;        color:var(--muted); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:5px; height:5px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border-2); border-radius:3px; }
+
+/* ── Approval Alert Banner ── */
+#approval-banner {
+  display:none; position:fixed; top:0; left:0; right:0; z-index:500;
+  background:#d97706; color:#fff; text-align:center; padding:13px 20px;
+  font-weight:600; font-size:14px; cursor:pointer; letter-spacing:.01em;
+  animation:pulse-banner 1.8s ease-in-out infinite;
+}
+#approval-banner.show { display:block; }
+@keyframes pulse-banner {
+  0%,100% { background:#d97706; }
+  50%      { background:#b45309; }
+}
 </style>
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen" x-data="app()" x-init="init()" x-cloak>
+<body>
+<!-- __SERVER_CONFIG__ -->
 
-<!-- TOAST -->
-<div x-show="toast" x-transition:enter="transition ease-out duration-200" x-transition:enter-start="opacity-0 translate-y-2" x-transition:enter-end="opacity-100 translate-y-0"
-  class="fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl shadow-2xl text-sm font-semibold max-w-xs"
-  :class="toast?.type==='success' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'"
-  x-text="toast?.message"></div>
+<div id="approval-banner" onclick="document.getElementById('approval-overlay').classList.add('open')">
+  ⚠️ Email ready — click here to review and approve before it sends
+</div>
 
-<!-- HEADER -->
-<header class="bg-gray-900 border-b border-gray-800 px-5 py-3 flex items-center justify-between sticky top-0 z-50">
-  <div class="flex items-center gap-3">
-    <div class="w-7 h-7 bg-green-500 rounded-md flex items-center justify-center font-black text-black text-xs">T</div>
-    <span class="font-bold">Tenacious</span>
-    <span class="text-gray-500 text-sm hidden sm:block">Conversion Engine</span>
-    <div class="flex items-center gap-1.5 ml-2">
-      <div class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></div>
-      <span class="text-gray-500 text-xs">Live</span>
+<div class="topbar">
+  <div class="logo">Tenacious <span>Engine</span></div>
+  <div class="topbar-right">
+    <span id="outbound-badge" class="outbound-badge outbound-sink">SINK MODE</span>
+    <div class="health-pill">
+      <span class="hdot" id="hDot"></span>
+      <span id="hLabel">checking…</span>
     </div>
-  </div>
-  <div class="flex items-center gap-3">
-    <span class="text-gray-600 text-xs" x-text="lastUpdated"></span>
-    <button @click="refresh()" :disabled="loading"
-      class="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs px-3 py-1.5 rounded-lg transition-colors">
-      <span x-text="loading ? 'Loading…' : 'Refresh'"></span>
-    </button>
-  </div>
-</header>
-
-<!-- STATS BAR -->
-<div class="bg-gray-900 border-b border-gray-800 px-5 py-3">
-  <div class="grid grid-cols-4 sm:grid-cols-7 gap-3">
-    <template x-for="s in stats" :key="s.label">
-      <div class="text-center">
-        <div class="text-xl font-bold" :class="s.color" x-text="s.value"></div>
-        <div class="text-xs text-gray-500 mt-0.5" x-text="s.label"></div>
-      </div>
-    </template>
+    <button class="btn btn-ghost btn-sm" onclick="loadLeads()">↻ Refresh</button>
   </div>
 </div>
 
-<!-- TABS -->
-<div class="bg-gray-900 border-b border-gray-800 px-5 flex gap-0">
-  <template x-for="t in tabs" :key="t.id">
-    <button @click="activeTab=t.id; selectedLead=null; selectedDbLead=null; selectedTrace=null"
-      class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors"
-      :class="activeTab===t.id ? 'border-green-500 text-green-400' : 'border-transparent text-gray-400 hover:text-gray-200'">
-      <span x-text="t.label"></span>
-      <span class="ml-1.5 bg-gray-700 text-gray-300 text-xs px-1.5 py-0.5 rounded-full" x-text="t.count"></span>
-    </button>
-  </template>
-</div>
+<div class="layout">
 
-<!-- MAIN: 2-COLUMN LAYOUT -->
-<div class="flex" style="height:calc(100vh - 152px)">
+<!-- ══════════════════ MAIN AREA ══════════════════ -->
+<main class="main-area">
 
-  <!-- LEFT LIST -->
-  <div class="w-72 shrink-0 border-r border-gray-800 flex flex-col bg-gray-900">
-    <div class="p-3 border-b border-gray-800 space-y-2">
-      <input x-model="search" type="text" placeholder="Search…"
-        class="w-full bg-gray-800 border border-gray-700 text-gray-100 text-xs px-3 py-1.5 rounded-lg focus:outline-none focus:border-blue-500"/>
-      <div class="flex gap-1.5">
-        <select x-model="filterStatus" class="flex-1 bg-gray-800 border border-gray-700 text-gray-300 text-xs px-2 py-1 rounded-lg">
-          <option value="">All Status</option>
-          <option value="new">New</option>
-          <option value="outreach_sent">Outreach Sent</option>
-          <option value="in_conversation">In Conversation</option>
-          <option value="qualified">Qualified</option>
-          <option value="disqualified">Disqualified</option>
-          <option value="booked">Booked</option>
-        </select>
-        <select x-model="filterSegment" class="flex-1 bg-gray-800 border border-gray-700 text-gray-300 text-xs px-2 py-1 rounded-lg">
-          <option value="">All Segments</option>
-          <option value="generic">Generic</option>
-          <option value="recently_funded">Funded</option>
-          <option value="restructuring_cost">Restructuring</option>
-          <option value="leadership_transition">Leadership</option>
-          <option value="capability_gap">Capability Gap</option>
-        </select>
-      </div>
+  <!-- Stats -->
+  <div class="stats" id="stats">
+    <div class="stat-card"><div class="stat-num c-all" id="s-total">—</div><div class="stat-lbl">Total</div></div>
+    <div class="stat-card"><div class="stat-num c-new"  id="s-new">—</div><div class="stat-lbl">New</div></div>
+    <div class="stat-card"><div class="stat-num c-sent" id="s-sent">—</div><div class="stat-lbl">Outreach Sent</div></div>
+    <div class="stat-card"><div class="stat-num c-conv" id="s-conv">—</div><div class="stat-lbl">Conversing</div></div>
+    <div class="stat-card"><div class="stat-num c-qual" id="s-qual">—</div><div class="stat-lbl">Qualified</div></div>
+    <div class="stat-card"><div class="stat-num c-disq" id="s-disq">—</div><div class="stat-lbl">Disqualified</div></div>
+  </div>
+
+  <!-- ── Pipeline Runner ── -->
+  <div class="panel">
+    <div class="panel-head open" id="pipe-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">⚡</span>Pipeline Runner</span>
+      <span class="chevron">▼</span>
     </div>
-
-    <div class="flex-1 overflow-y-auto">
-
-      <!-- PIPELINE LIST -->
-      <template x-if="activeTab==='pipeline'">
-        <div>
-          <template x-for="lead in filteredBatch" :key="lead._slug">
-            <div @click="selectedLead=lead" class="p-3 border-b border-gray-800 cursor-pointer transition-colors"
-              :class="selectedLead?._slug===lead._slug ? 'bg-gray-800' : 'hover:bg-gray-800/40'">
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-semibold text-sm truncate" x-text="lead.input?.name || lead.enrichment?.company_name || '—'"></span>
-                <span class="text-xs px-1.5 py-0.5 rounded-full shrink-0 ml-1" :class="statusBadge(lead._status)" x-text="lead._status?.replace('_',' ')"></span>
-              </div>
-              <div class="text-xs text-gray-500 truncate mb-1.5" x-text="lead.input?.contact_email || lead.input?.domain"></div>
-              <div class="flex flex-wrap gap-1">
-                <span class="text-xs px-1 py-0.5 bg-blue-900/40 text-blue-300 rounded" x-text="'AI '+( lead.ai_maturity?.score ?? '?')"></span>
-                <span class="text-xs px-1 py-0.5 bg-purple-900/40 text-purple-300 rounded capitalize" x-text="lead.segment?.label||'generic'"></span>
-                <span x-show="lead.conversation?.qualified" class="text-xs px-1 py-0.5 bg-green-900/40 text-green-300 rounded">Qualified</span>
-                <span x-show="lead.booking?.success" class="text-xs px-1 py-0.5 bg-yellow-900/40 text-yellow-300 rounded">Booked</span>
-              </div>
-            </div>
-          </template>
-          <div x-show="filteredBatch.length===0" class="p-8 text-center text-gray-600 text-sm">No results</div>
-        </div>
-      </template>
-
-      <!-- LIVE LIST -->
-      <template x-if="activeTab==='live'">
-        <div>
-          <template x-for="lead in filteredDb" :key="lead.email">
-            <div @click="selectedDbLead=lead" class="p-3 border-b border-gray-800 cursor-pointer transition-colors"
-              :class="selectedDbLead?.email===lead.email ? 'bg-gray-800' : 'hover:bg-gray-800/40'">
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-semibold text-sm truncate" x-text="lead.profile?.company_name || lead.email"></span>
-                <span class="text-xs px-1.5 py-0.5 rounded-full shrink-0 ml-1" :class="statusBadge(lead.status)" x-text="lead.status?.replace('_',' ')"></span>
-              </div>
-              <div class="text-xs text-gray-500 truncate mb-1.5" x-text="lead.email"></div>
-              <div class="flex gap-1">
-                <span class="text-xs px-1 py-0.5 bg-blue-900/40 text-blue-300 rounded" x-text="'AI '+(lead.profile?.ai_maturity_score??'?')"></span>
-                <span class="text-xs px-1 py-0.5 bg-gray-700 text-gray-300 rounded" x-text="lead.turns+' turns'"></span>
-              </div>
-            </div>
-          </template>
-          <div x-show="filteredDb.length===0" class="p-8 text-center text-gray-600 text-sm">No live leads in database</div>
-        </div>
-      </template>
-
-      <!-- TRACES LIST -->
-      <template x-if="activeTab==='traces'">
-        <div>
-          <template x-for="tr in filteredTraces" :key="tr.trace_id">
-            <div @click="selectedTrace=tr" class="p-3 border-b border-gray-800 cursor-pointer transition-colors"
-              :class="selectedTrace?.trace_id===tr.trace_id ? 'bg-gray-800' : 'hover:bg-gray-800/40'">
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-mono text-xs text-gray-300 truncate" x-text="tr.trace_id"></span>
-                <span class="text-xs px-1.5 py-0.5 rounded-full shrink-0 ml-1"
-                  :class="tr.reward===1 ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'"
-                  x-text="tr.reward===1 ? 'Pass' : 'Fail'"></span>
-              </div>
-              <div class="flex gap-2 text-xs text-gray-500 mt-1">
-                <span x-text="tr.segment"></span>
-                <span x-text="tr.conversation_turns+' turns'"></span>
-                <span x-text="tr.duration_s+'s'"></span>
-              </div>
-            </div>
-          </template>
-        </div>
-      </template>
-
-      <!-- RUN PIPELINE LEFT PANEL -->
-      <template x-if="activeTab==='run'">
-        <div class="flex flex-col h-full">
-          <!-- Upload + config section -->
-          <div class="p-3 border-b border-gray-800 space-y-2 shrink-0">
-            <label class="block cursor-pointer bg-gray-800 border-2 border-dashed border-gray-600 hover:border-green-500 rounded-lg p-3 text-center transition-colors">
-              <input type="file" accept=".csv" class="hidden" @change="uploadCSV($event)">
-              <div class="text-sm font-medium text-gray-300">Upload CSV</div>
-              <div class="text-xs text-gray-500 mt-0.5">Needs an <span class="font-mono text-green-400">email</span> column</div>
-            </label>
-            <div class="flex items-center gap-2">
-              <span class="text-xs text-gray-400 shrink-0">Run</span>
-              <input type="number" x-model.number="csvLimit" min="1" max="100"
-                class="w-16 bg-gray-800 border border-gray-700 text-gray-100 text-sm px-2 py-1 rounded-lg text-center focus:outline-none focus:border-green-500">
-              <span class="text-xs text-gray-400 shrink-0">companies</span>
-            </div>
-            <button @click="startPipeline()"
-              :disabled="!csvRows.length || runJob?.status==='running'"
-              class="w-full bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold py-2 rounded-lg transition-colors">
-              <span x-show="runJob?.status==='running'" class="flex items-center justify-center gap-2">
-                <span class="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>
-                Running…
-              </span>
-              <span x-show="runJob?.status!=='running'">▶ Run Pipeline</span>
-            </button>
-            <div x-show="csvRows.length" class="text-xs text-gray-500 text-center"
-              x-text="csvRows.length + ' rows loaded · running ' + Math.min(csvLimit, csvRows.length)"></div>
+    <div class="panel-body open" id="pipe-body">
+      <div class="pipe-form">
+        <div class="form-row">
+          <div class="field">
+            <label>Lead Email</label>
+            <input type="email" id="pipe-email" placeholder="prospect@company.com">
           </div>
-          <!-- Company list -->
-          <div class="flex-1 overflow-y-auto">
-            <template x-for="(row, i) in runCompanies" :key="row.email||i">
-              <div @click="selectedRunRow=row" class="p-3 border-b border-gray-800 cursor-pointer transition-colors"
-                :class="selectedRunRow?.email===row.email ? 'bg-gray-800' : 'hover:bg-gray-800/40'">
-                <div class="flex items-center justify-between mb-1">
-                  <span class="font-semibold text-sm truncate"
-                    x-text="row.result?.company_name||row.company||row.email"></span>
-                  <span class="text-xs px-1.5 py-0.5 rounded-full shrink-0 ml-1"
-                    :class="runStatusBadge(row.status)" x-text="row.status"></span>
-                </div>
-                <div class="text-xs text-gray-500 truncate" x-text="row.email"></div>
-                <template x-if="row.status==='running'">
-                  <div class="text-xs text-blue-400 mt-1 animate-pulse truncate"
-                    x-text="'→ '+(row.current_step||'Running…')"></div>
-                </template>
-                <template x-if="row.status==='done' && row.result">
-                  <div class="flex gap-1 mt-1 flex-wrap">
-                    <span class="text-xs px-1 py-0.5 bg-blue-900/40 text-blue-300 rounded"
-                      x-text="'AI '+row.result.ai_maturity_score"></span>
-                    <span class="text-xs px-1 py-0.5 bg-purple-900/40 text-purple-300 rounded capitalize"
-                      x-text="row.result.segment"></span>
-                    <span x-show="row.result.email_sent"
-                      class="text-xs px-1 py-0.5 bg-green-900/40 text-green-300 rounded">Email ✓</span>
-                    <span x-show="row.result.booking_success"
-                      class="text-xs px-1 py-0.5 bg-yellow-900/40 text-yellow-300 rounded">Booked ✓</span>
-                  </div>
-                </template>
-                <template x-if="row.status==='error'">
-                  <div class="text-xs text-red-400 mt-1 truncate" x-text="row.error"></div>
-                </template>
-              </div>
-            </template>
-            <div x-show="!runCompanies.length" class="p-8 text-center text-gray-600 text-sm">
-              Upload a CSV to get started
-            </div>
+          <div class="field">
+            <label>Opening Message (optional)</label>
+            <input type="text" id="pipe-text" placeholder="Tell me more about your engineering team.">
           </div>
+          <button class="btn btn-primary" id="pipe-btn" onclick="startPipeline()">
+            <span id="pipe-spin" style="display:none" class="btn-spinner"></span>
+            Run Pipeline
+          </button>
         </div>
-      </template>
+      </div>
 
+      <div id="pipe-progress-wrap" style="display:none">
+        <div class="progress-wrap">
+          <div class="progress-label">
+            <span id="pipe-status-text">Starting…</span>
+            <span id="pipe-pct">0%</span>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="pipe-fill"></div></div>
+        </div>
+        <div class="steps-list" id="pipe-steps"></div>
+        <div class="pipe-status-msg" id="pipe-msg"></div>
+      </div>
     </div>
   </div>
 
-  <!-- RIGHT DETAIL -->
-  <div class="flex-1 overflow-y-auto bg-gray-950">
-
-    <!-- ── PIPELINE DETAIL ── -->
-    <template x-if="activeTab==='pipeline' && selectedLead">
-      <div class="p-5 space-y-4" x-data="{open:'overview'}">
-
-        <!-- Company Header Card -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <div class="flex items-start justify-between flex-wrap gap-3">
-            <div>
-              <h2 class="text-xl font-bold" x-text="selectedLead.input?.name || selectedLead.enrichment?.company_name"></h2>
-              <a :href="'https://'+selectedLead.input?.domain" target="_blank"
-                class="text-blue-400 text-sm hover:underline" x-text="selectedLead.input?.domain"></a>
-              <div class="text-xs text-gray-500 mt-0.5" x-text="'Contact: '+(selectedLead.input?.contact_email||'—')"></div>
-            </div>
-            <div class="flex flex-col items-end gap-1.5">
-              <span class="px-2.5 py-1 rounded-full text-xs font-semibold" :class="statusBadge(selectedLead._status)" x-text="selectedLead._status?.replace('_',' ')"></span>
-              <span class="text-xs text-gray-600" x-text="selectedLead.processed_at||''"></span>
-            </div>
-          </div>
-
-          <!-- Quick Stats -->
-          <div class="mt-4 grid grid-cols-2 sm:grid-cols-5 gap-3">
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-blue-400" x-text="selectedLead.enrichment?.headcount||'N/A'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Headcount</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-purple-400 text-sm" x-text="selectedLead.enrichment?.funding_stage||'N/A'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Funding</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold" :class="aiColor(selectedLead.ai_maturity?.score)" x-text="(selectedLead.ai_maturity?.score??'?')+'/3'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">AI Maturity</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-cyan-400" x-text="selectedLead.conversation?.reply_turns?.length||0"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Conv. Turns</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold" :class="selectedLead.input?.country_code ? 'text-gray-200' : 'text-gray-600'" x-text="selectedLead.input?.country_code||'—'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Country</div>
-            </div>
-          </div>
-
-          <!-- Pipeline Progress -->
-          <div class="mt-4">
-            <div class="text-xs text-gray-500 mb-2">Pipeline Stages</div>
-            <div class="flex items-center">
-              <template x-for="(st, i) in pipelineStages(selectedLead)" :key="st.name">
-                <div class="flex items-center">
-                  <div class="flex flex-col items-center">
-                    <div class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold"
-                      :class="st.done ? 'bg-green-500 text-black' : 'bg-gray-800 text-gray-500'">
-                      <span x-show="st.done">✓</span>
-                      <span x-show="!st.done" x-text="i+1"></span>
-                    </div>
-                    <div class="text-xs mt-1 w-14 text-center leading-tight"
-                      :class="st.done ? 'text-green-400' : 'text-gray-600'" x-text="st.name"></div>
-                  </div>
-                  <div x-show="i<5" class="w-6 h-px mb-5" :class="st.done ? 'bg-green-500' : 'bg-gray-700'"></div>
-                </div>
-              </template>
-            </div>
-          </div>
+  <!-- ── Email Outreach ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">✉️</span>Email Outreach</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+        Compose a draft email for any lead (runs enrichment + LLM compose). Review and edit before sending.
+      </p>
+      <div class="form-row">
+        <div class="field">
+          <label>Lead Email</label>
+          <input type="email" id="em-email" placeholder="prospect@company.com">
         </div>
-
-        <!-- ENRICHMENT -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='enrich'?'':'enrich'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-green-400">Enrichment</span>
-              <span class="text-xs text-gray-500">Multi-source company signals</span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='enrich'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='enrich'" x-collapse class="px-5 pb-5 space-y-4">
-            <div class="grid grid-cols-2 gap-3">
-              <div class="bg-gray-800 rounded-lg p-4">
-                <div class="text-xs text-gray-500 mb-1">AI Maturity Score</div>
-                <div class="flex items-center gap-3">
-                  <div class="text-3xl font-black" :class="aiColor(selectedLead.ai_maturity?.score)" x-text="selectedLead.ai_maturity?.score??'?'"></div>
-                  <div>
-                    <div class="font-semibold text-sm" :class="aiColor(selectedLead.ai_maturity?.score)" x-text="selectedLead.ai_maturity?.label"></div>
-                    <div class="text-xs text-gray-500 leading-tight" x-text="selectedLead.ai_maturity?.reason"></div>
-                  </div>
-                </div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-4">
-                <div class="text-xs text-gray-500 mb-1">Segment</div>
-                <div class="font-bold capitalize" x-text="selectedLead.segment?.label||'generic'"></div>
-                <div class="text-xs text-gray-500 mt-1 space-x-1">
-                  <span x-show="selectedLead.enrichment?.recently_funded" class="text-yellow-400">Recently Funded</span>
-                  <span x-show="selectedLead.enrichment?.had_layoffs" class="text-red-400">Had Layoffs</span>
-                  <span x-text="(selectedLead.enrichment?.headcount_growth_pct||0)+'% growth'"></span>
-                </div>
-                <div class="text-xs text-gray-500 mt-1" x-text="(selectedLead.enrichment?.open_engineering_roles||0)+' open eng roles'"></div>
-              </div>
-            </div>
-
-            <div class="space-y-2">
-              <div class="text-xs text-gray-500 uppercase tracking-wider font-medium">Signal Sources</div>
-              <template x-for="sig in enrichSignals(selectedLead)" :key="sig.name">
-                <div class="bg-gray-800 rounded-lg p-3">
-                  <div class="flex items-center justify-between mb-1.5">
-                    <div class="flex items-center gap-2">
-                      <span class="text-sm" x-text="sig.name"></span>
-                      <span class="text-xs px-1.5 py-0.5 rounded font-mono"
-                        :class="sig.conf>0.5 ? 'bg-green-900/50 text-green-400' : 'bg-gray-700 text-gray-400'"
-                        x-text="sig.source"></span>
-                    </div>
-                    <span class="text-xs font-mono text-gray-400" x-text="Math.round(sig.conf*100)+'%'"></span>
-                  </div>
-                  <div class="h-1.5 bg-gray-700 rounded-full">
-                    <div class="h-full rounded-full bar" :class="sig.conf>0.5?'bg-green-500':'bg-gray-500'" :style="'width:'+Math.round(sig.conf*100)+'%'"></div>
-                  </div>
-                </div>
-              </template>
-            </div>
-
-            <!-- Leadership change -->
-            <div x-show="selectedLead.enrichment?.leadership_change?.detected" class="bg-yellow-950/30 border border-yellow-800/30 rounded-lg p-3">
-              <div class="text-xs text-yellow-400 font-medium mb-1">Leadership Change Detected</div>
-              <div class="text-sm text-gray-300">
-                <span x-text="selectedLead.enrichment?.leadership_change?.changed_role"></span>
-                · <span x-text="selectedLead.enrichment?.leadership_change?.change_type"></span>
-                · <span x-text="selectedLead.enrichment?.leadership_change?.days_since_change+' days ago'"></span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- EMAIL -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='email'?'':'email'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-blue-400">Email Outreach</span>
-              <span class="text-xs px-2 py-0.5 rounded-full"
-                :class="selectedLead.email?.tone_check ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300'"
-                x-text="selectedLead.email?.tone_check ? '✓ Tone OK' : '✗ Tone Failed'"></span>
-              <span x-show="selectedLead.email?.dry_send" class="text-xs text-gray-500">dry-run</span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='email'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='email'" x-collapse class="px-5 pb-5 space-y-3">
-            <div class="text-xs text-gray-500">
-              To: <span class="text-gray-300 font-medium" x-text="selectedLead.email?.send_result?.to || selectedLead.input?.contact_email"></span>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4">
-              <div class="text-xs text-gray-500 mb-1">Subject</div>
-              <div class="font-semibold" x-text="selectedLead.email?.subject"></div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4">
-              <div class="text-xs text-gray-500 mb-2">Body</div>
-              <div class="text-sm text-gray-200 whitespace-pre-wrap font-mono leading-relaxed" x-text="selectedLead.email?.body"></div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-3">
-              <div class="text-xs text-gray-500 mb-2">Tone Check</div>
-              <div class="flex gap-4 text-sm">
-                <div class="flex items-center gap-1.5">
-                  <div class="w-2 h-2 rounded-full" :class="selectedLead.email?.det_ok ? 'bg-green-500' : 'bg-red-500'"></div>
-                  Deterministic
-                </div>
-                <div class="flex items-center gap-1.5">
-                  <div class="w-2 h-2 rounded-full" :class="selectedLead.email?.tone_check ? 'bg-green-500' : 'bg-red-500'"></div>
-                  LLM Tone
-                </div>
-              </div>
-              <div x-show="selectedLead.email?.violations?.length" class="mt-2 space-y-1">
-                <template x-for="v in selectedLead.email?.violations||[]" :key="v">
-                  <div class="text-xs text-red-400 font-mono" x-text="'· '+v"></div>
-                </template>
-              </div>
-              <div x-show="!selectedLead.email?.violations?.length" class="text-xs text-green-400 mt-2">No violations</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- COMPETITORS -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='comp'?'':'comp'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-orange-400">Competitor Analysis</span>
-              <span class="text-xs text-gray-500" x-text="(selectedLead.competitor_gap_brief?.competitors?.length||0)+' competitors'"></span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='comp'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='comp'" x-collapse class="px-5 pb-5 space-y-3">
-            <div class="bg-orange-950/20 border border-orange-800/30 rounded-lg p-3">
-              <div class="text-xs text-orange-400 font-medium mb-1">Recommended Angle</div>
-              <div class="text-sm" x-text="selectedLead.competitor_gap_brief?.recommended_angle"></div>
-            </div>
-            <div class="text-xs text-gray-500" x-text="selectedLead.competitor_gap_brief?.top_gap_summary"></div>
-            <template x-for="c in selectedLead.competitor_gap_brief?.competitors||[]" :key="c.name">
-              <div class="bg-gray-800 rounded-lg p-4">
-                <div class="font-bold mb-2" x-text="c.name"></div>
-                <div class="space-y-1.5 text-sm">
-                  <div><span class="text-gray-500 text-xs">Positioning: </span><span class="text-gray-300" x-text="c.positioning"></span></div>
-                  <div><span class="text-red-400 text-xs">Gap: </span><span class="text-gray-300" x-text="c.gap"></span></div>
-                  <div><span class="text-green-400 text-xs">Our Advantage: </span><span class="text-gray-300" x-text="c.tenacious_advantage"></span></div>
-                </div>
-              </div>
-            </template>
-          </div>
-        </div>
-
-        <!-- CONVERSATION -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='conv'?'':'conv'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-cyan-400">Conversation</span>
-              <span class="text-xs text-gray-500" x-text="(selectedLead.conversation?.reply_turns?.length||0)+' turns'"></span>
-              <span x-show="selectedLead.conversation?.qualified" class="text-xs px-2 py-0.5 rounded-full bg-green-900/50 text-green-300">Qualified</span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='conv'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='conv'" x-collapse class="px-5 pb-5 space-y-3">
-            <!-- Initial outreach -->
-            <div class="bubble-agent rounded-lg p-4">
-              <div class="text-xs text-green-400 font-medium mb-1">Tenacious Agent · Initial Outreach</div>
-              <div class="font-semibold text-sm mb-1" x-text="selectedLead.email?.subject"></div>
-              <div class="text-sm text-gray-300 whitespace-pre-wrap" x-text="selectedLead.email?.body"></div>
-            </div>
-            <!-- Turns -->
-            <template x-for="(turn, i) in selectedLead.conversation?.reply_turns||[]" :key="i">
-              <div>
-                <div class="bubble-prospect rounded-lg p-4">
-                  <div class="flex items-center justify-between mb-1">
-                    <span class="text-xs text-blue-400 font-medium">
-                      <span x-text="selectedLead.input?.name||'Prospect'"></span> · Turn <span x-text="turn.turn"></span>
-                    </span>
-                    <span x-show="turn.qualified" class="text-xs bg-green-900/50 text-green-300 px-2 py-0.5 rounded-full">Qualified</span>
-                  </div>
-                  <div class="text-sm text-gray-200" x-text="turn.text"></div>
-                </div>
-              </div>
-            </template>
-            <div x-show="selectedLead.conversation?.qualified"
-              class="bg-green-950/20 border border-green-800/30 rounded-lg p-3 text-center text-green-400 text-sm">
-              Lead qualified after <span class="font-bold" x-text="selectedLead.conversation?.reply_turns?.length"></span> turns
-            </div>
-          </div>
-        </div>
-
-        <!-- BOOKING -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='book'?'':'book'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-yellow-400">Booking</span>
-              <span class="text-xs px-2 py-0.5 rounded-full"
-                :class="selectedLead.booking?.success ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-400'"
-                x-text="selectedLead.booking?.success ? '✓ Booked' : '✗ Not Booked'"></span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='book'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='book'" x-collapse class="px-5 pb-5 space-y-3">
-            <div class="flex justify-end">
-              <button @click.stop="syncBooking(selectedLead._slug)"
-                :disabled="syncState[selectedLead._slug]?.booking === 'loading'"
-                class="bg-yellow-500 hover:bg-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed text-black text-xs font-semibold px-4 py-1.5 rounded-lg transition-colors">
-                <span x-text="syncState[selectedLead._slug]?.booking==='loading' ? 'Booking…' : syncState[selectedLead._slug]?.booking==='ok' ? '✓ Booked' : 'Book Call'"></span>
-              </button>
-            </div>
-            <template x-if="selectedLead.booking?.success">
-              <div class="bg-green-950/20 border border-green-800/30 rounded-lg p-4 space-y-2 text-sm">
-                <div><span class="text-gray-500">Slot: </span><span class="font-medium" x-text="selectedLead.booking?.slot"></span></div>
-                <div><span class="text-gray-500">URL: </span><a :href="selectedLead.booking?.booking_url" target="_blank" class="text-blue-400 hover:underline break-all" x-text="selectedLead.booking?.booking_url"></a></div>
-              </div>
-            </template>
-            <template x-if="!selectedLead.booking?.success">
-              <div class="bg-red-950/20 border border-red-800/30 rounded-lg p-4 text-sm">
-                <span class="text-red-400">Error: </span><span x-text="selectedLead.booking?.error||'Booking not attempted'"></span>
-              </div>
-            </template>
-          </div>
-        </div>
-
-        <!-- HUBSPOT -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='hs'?'':'hs'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-orange-400">HubSpot CRM</span>
-              <span class="text-xs px-2 py-0.5 rounded-full"
-                :class="selectedLead.hubspot?.contact_id ? 'bg-green-900/50 text-green-300' : 'bg-gray-700 text-gray-400'"
-                x-text="selectedLead.hubspot?.contact_id ? 'Synced' : 'Not Synced'"></span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='hs'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='hs'" x-collapse class="px-5 pb-5 space-y-3">
-            <div class="flex justify-end">
-              <button @click.stop="syncCRM(selectedLead._slug)"
-                :disabled="syncState[selectedLead._slug]?.crm === 'loading'"
-                class="bg-orange-500 hover:bg-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold px-4 py-1.5 rounded-lg transition-colors">
-                <span x-text="syncState[selectedLead._slug]?.crm==='loading' ? 'Syncing…' : syncState[selectedLead._slug]?.crm==='ok' ? '✓ Synced' : 'Sync to CRM'"></span>
-              </button>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4">
-              <div class="text-xs text-gray-500 mb-1">Contact ID</div>
-              <div class="font-mono text-sm" x-text="selectedLead.hubspot?.contact_id||'Not synced'"></div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4">
-              <div class="text-xs text-gray-500 mb-2">Custom Fields</div>
-              <div class="space-y-2">
-                <template x-for="[k,v] in Object.entries(selectedLead.hubspot?.fields||{})" :key="k">
-                  <div class="flex justify-between text-xs">
-                    <span class="font-mono text-gray-500" x-text="k"></span>
-                    <span class="text-gray-300" x-text="v||'—'"></span>
-                  </div>
-                </template>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ABLATION -->
-        <div x-show="selectedLead.ablation_comparison" class="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-          <button @click="open=open==='abl'?'':'abl'" class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40">
-            <div class="flex items-center gap-3">
-              <span class="font-semibold text-pink-400">Ablation Comparison</span>
-              <span class="text-xs text-gray-500">vs baselines</span>
-            </div>
-            <svg class="w-4 h-4 text-gray-500 transition-transform" :class="open==='abl'?'rotate-180':''" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-          </button>
-          <div x-show="open==='abl'" x-collapse class="px-5 pb-5 space-y-3">
-            <div class="grid grid-cols-3 gap-3">
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-pink-400" x-text="Math.round((selectedLead.ablation_comparison?.ablation_method_pass_at_1||0)*100)+'%'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Our Method</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-gray-400" x-text="Math.round((selectedLead.ablation_comparison?.tau2_bench_baseline_pass_at_1||0)*100)+'%'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">τ² Bench</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-xl font-bold text-red-400" x-text="Math.round((selectedLead.ablation_comparison?.ablation_baseline_pass_at_1||0)*100)+'%'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Baseline</div>
-              </div>
-            </div>
-            <div class="text-xs text-gray-400 bg-gray-800 rounded-lg p-3" x-text="selectedLead.ablation_comparison?.note"></div>
-          </div>
-        </div>
-
+        <button class="btn btn-ghost" id="em-compose-btn" onclick="composeEmail()">
+          <span id="em-compose-spin" style="display:none" class="btn-spinner" style="border-top-color:var(--accent)"></span>
+          Compose Draft
+        </button>
       </div>
-    </template>
-
-    <!-- ── LIVE LEAD DETAIL ── -->
-    <template x-if="activeTab==='live' && selectedDbLead">
-      <div class="p-5 space-y-4">
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h2 class="text-xl font-bold" x-text="selectedDbLead.profile?.company_name||selectedDbLead.email"></h2>
-          <div class="text-gray-500 text-sm" x-text="selectedDbLead.email"></div>
-          <div x-show="selectedDbLead.phone" class="text-gray-500 text-xs mt-0.5" x-text="'Phone: '+selectedDbLead.phone"></div>
-          <div class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-sm" :class="statusBadge(selectedDbLead.status).split(' ')[1]" x-text="selectedDbLead.status?.replace('_',' ')"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Status</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-green-400" x-text="selectedDbLead.turns"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Turns</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold" :class="aiColor(selectedDbLead.profile?.ai_maturity_score)" x-text="selectedDbLead.profile?.ai_maturity_score??'N/A'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">AI Maturity</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold" :class="selectedDbLead.booking_url ? 'text-yellow-400' : 'text-gray-600'" x-text="selectedDbLead.booking_url ? '✓ Booked' : 'Not Booked'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Booking</div>
-            </div>
-          </div>
-          <div x-show="selectedDbLead.booking_url" class="mt-3 text-xs">
-            <span class="text-gray-500">Booking URL: </span>
-            <a :href="selectedDbLead.booking_url" target="_blank" class="text-blue-400 hover:underline" x-text="selectedDbLead.booking_url"></a>
-          </div>
-          <!-- Sync Actions -->
-          <div class="flex gap-2 mt-4">
-            <button @click="syncBookingDb(selectedDbLead.email)"
-              :disabled="syncState['db:'+selectedDbLead.email]?.booking==='loading'"
-              class="bg-yellow-500 hover:bg-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed text-black text-xs font-semibold px-4 py-2 rounded-lg transition-colors">
-              <span x-text="syncState['db:'+selectedDbLead.email]?.booking==='loading' ? 'Booking…' : syncState['db:'+selectedDbLead.email]?.booking==='ok' ? '✓ Booked' : 'Book Call'"></span>
-            </button>
-            <button @click="syncCrmDb(selectedDbLead.email)"
-              :disabled="syncState['db:'+selectedDbLead.email]?.crm==='loading'"
-              class="bg-orange-500 hover:bg-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors">
-              <span x-text="syncState['db:'+selectedDbLead.email]?.crm==='loading' ? 'Syncing…' : syncState['db:'+selectedDbLead.email]?.crm==='ok' ? '✓ Synced' : 'Sync to CRM'"></span>
-            </button>
-          </div>
+      <div id="em-draft-wrap" style="display:none">
+        <div class="approval-to-row" style="margin-bottom:12px">
+          <span class="approval-to-label">To</span>
+          <span class="approval-to-email" id="em-to"></span>
+          <span id="em-sink-note" class="sink-note" style="display:none">→ redirected to sink</span>
         </div>
-
-        <!-- Enrichment Profile -->
-        <div x-show="selectedDbLead.profile?.company_name" class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h3 class="font-semibold text-green-400 mb-3">Company Profile</h3>
-          <div class="grid grid-cols-2 gap-2 text-sm">
-            <template x-for="[k,v] in Object.entries(selectedDbLead.profile||{}).filter(([k])=>!['raw','crunchbase_signal','job_posts_signal','layoffs_signal','leadership_change_signal','leadership_change'].includes(k))" :key="k">
-              <div class="flex gap-2">
-                <span class="text-gray-500 text-xs capitalize shrink-0" x-text="k.replace(/_/g,' ')"></span>
-                <span class="text-gray-300 text-xs font-mono break-all" x-text="JSON.stringify(v)"></span>
-              </div>
-            </template>
-          </div>
+        <div class="field" style="margin-bottom:10px">
+          <label>Subject</label>
+          <input type="text" id="em-subject">
         </div>
-
-        <!-- Conversation history -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h3 class="font-semibold text-cyan-400 mb-3">Conversation History</h3>
-          <div class="space-y-3">
-            <template x-for="(msg, i) in selectedDbLead.history||[]" :key="i">
-              <div class="rounded-lg p-4" :class="msg.role==='agent' ? 'bubble-agent' : 'bubble-prospect'">
-                <div class="text-xs font-medium mb-1" :class="msg.role==='agent' ? 'text-green-400' : 'text-blue-400'"
-                  x-text="msg.role==='agent' ? 'Tenacious Agent' : 'Prospect'"></div>
-                <div class="text-sm" x-text="msg.content"></div>
-                <div class="text-xs text-gray-600 mt-1" x-text="msg.ts||''"></div>
-              </div>
-            </template>
-            <div x-show="!selectedDbLead.history?.length" class="text-gray-600 text-sm text-center py-4">No conversation history yet</div>
-          </div>
+        <div class="field" style="margin-bottom:14px">
+          <label>Body</label>
+          <textarea id="em-body" style="min-height:140px"></textarea>
+        </div>
+        <div style="display:flex;gap:10px">
+          <button class="btn btn-success" onclick="sendComposedEmail()">
+            <span id="em-send-spin" style="display:none" class="btn-spinner"></span>
+            Approve &amp; Send
+          </button>
+          <button class="btn btn-ghost" onclick="document.getElementById('em-draft-wrap').style.display='none'">Cancel</button>
         </div>
       </div>
-    </template>
+      <pre class="result-box" id="em-result"></pre>
+    </div>
+  </div>
 
-    <!-- ── TRACE DETAIL ── -->
-    <template x-if="activeTab==='traces' && selectedTrace">
-      <div class="p-5 space-y-4">
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <span class="font-mono text-sm text-gray-300" x-text="selectedTrace.trace_id"></span>
-            <span class="px-3 py-1 rounded-full text-sm font-semibold"
-              :class="selectedTrace.reward===1 ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'"
-              x-text="selectedTrace.reward===1 ? 'PASS' : 'FAIL'"></span>
+  <!-- ── Competitor Gap Analysis ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">🎯</span>Competitor Gap Analysis</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+        Runs enrichment + signals research + gap brief for any lead email.
+      </p>
+      <div class="form-row">
+        <div class="field">
+          <label>Lead Email</label>
+          <input type="email" id="gap-email" placeholder="prospect@company.com">
+        </div>
+        <button class="btn btn-primary" id="gap-btn" onclick="analyzeGap()">
+          <span id="gap-spin" style="display:none" class="btn-spinner"></span>
+          Analyze Gap
+        </button>
+      </div>
+      <pre class="result-box" id="gap-result"></pre>
+    </div>
+  </div>
+
+  <!-- ── CRM Sync ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">🔗</span>CRM Sync (HubSpot)</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+        Manually upsert a lead into HubSpot using their current profile from the DB.
+      </p>
+      <div class="form-row">
+        <div class="field">
+          <label>Lead Email</label>
+          <input type="email" id="crm-email" placeholder="prospect@company.com">
+        </div>
+        <button class="btn btn-primary" id="crm-btn" onclick="syncCRM()">
+          <span id="crm-spin" style="display:none" class="btn-spinner"></span>
+          Sync to HubSpot
+        </button>
+      </div>
+      <pre class="result-box" id="crm-result"></pre>
+    </div>
+  </div>
+
+  <!-- ── SMS Simulation ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">📱</span>SMS Simulation</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <div class="form-row">
+        <div class="field">
+          <label>Lead Email</label>
+          <input type="email" id="sms-email" placeholder="prospect@company.com">
+        </div>
+        <div class="field">
+          <label>Phone Number</label>
+          <input type="tel" id="sms-phone" placeholder="+254712345678">
+        </div>
+        <div class="field">
+          <label>Message</label>
+          <input type="text" id="sms-text" placeholder="Yes, let's talk.">
+        </div>
+        <button class="btn btn-primary" id="sms-btn" onclick="simulateSMS()">
+          <span id="sms-spin" style="display:none" class="btn-spinner"></span>
+          Send SMS
+        </button>
+      </div>
+      <pre class="result-box" id="sms-result"></pre>
+    </div>
+  </div>
+
+  <!-- ── Reply Simulation ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">💬</span>Reply Simulation</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <div class="form-row">
+        <div class="field">
+          <label>Lead Email</label>
+          <input type="email" id="reply-email" placeholder="prospect@company.com">
+        </div>
+        <div class="field">
+          <label>Reply Text</label>
+          <input type="text" id="reply-text" placeholder="I'm interested, tell me more.">
+        </div>
+        <button class="btn btn-primary" id="reply-btn" onclick="simulateReply()">
+          <span id="reply-spin" style="display:none" class="btn-spinner"></span>
+          Send Reply
+        </button>
+      </div>
+      <pre class="result-box" id="reply-result"></pre>
+    </div>
+  </div>
+
+  <!-- ── Batch Upload & Run ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">📁</span>Batch Upload &amp; Run</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+        Upload a CSV, PDF, or DOCX file with company info. Set how many companies to run,
+        then start the batch pipeline (auto-sends emails using compose &amp; send, no per-email approval).
+      </p>
+
+      <!-- Upload zone -->
+      <div class="upload-zone" id="upload-zone"
+           ondragover="event.preventDefault();this.classList.add('drag-over')"
+           ondragleave="this.classList.remove('drag-over')"
+           ondrop="handleDrop(event)"
+           onclick="document.getElementById('batch-file-input').click()">
+        <div class="upload-icon">📂</div>
+        <div class="upload-label">Drop file here or click to browse</div>
+        <div class="upload-hint">Accepts .csv · .pdf · .docx</div>
+        <input type="file" id="batch-file-input" accept=".csv,.pdf,.docx"
+               style="display:none" onchange="handleFileSelect(event)">
+      </div>
+      <div id="batch-parse-error" style="display:none;color:var(--red);font-size:12px;margin-top:8px"></div>
+
+      <!-- Preview + controls (shown after parse) -->
+      <div id="batch-preview" style="display:none;margin-top:16px">
+        <div class="batch-controls">
+          <span class="batch-count-badge" id="batch-count-badge">0 companies</span>
+          <div class="field">
+            <label>Run first N companies</label>
+            <input type="number" id="batch-n" min="1" value="5" style="width:90px">
           </div>
-          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-blue-400 capitalize" x-text="selectedTrace.segment"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Segment</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-cyan-400" x-text="selectedTrace.conversation_turns"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Turns</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-purple-400" x-text="selectedTrace.duration_s+'s'"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Duration</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-              <div class="font-bold text-yellow-400" x-text="'$'+selectedTrace.agent_cost_usd"></div>
-              <div class="text-xs text-gray-500 mt-0.5">Cost</div>
-            </div>
-          </div>
-          <div class="grid grid-cols-3 gap-3 mb-4">
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center text-sm font-medium"
-              :class="selectedTrace.engaged ? 'text-green-400' : 'text-gray-600'"
-              x-text="selectedTrace.engaged ? '✓ Engaged' : '✗ Not Engaged'"></div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center text-sm font-medium"
-              :class="selectedTrace.qualified ? 'text-green-400' : 'text-gray-600'"
-              x-text="selectedTrace.qualified ? '✓ Qualified' : '✗ Not Qualified'"></div>
-            <div class="bg-gray-800 rounded-lg p-2.5 text-center text-sm font-medium"
-              :class="selectedTrace.booked ? 'text-green-400' : 'text-gray-600'"
-              x-text="selectedTrace.booked ? '✓ Booked' : '✗ Not Booked'"></div>
-          </div>
-          <div class="text-xs text-gray-500"><span class="text-gray-400">AI Maturity: </span><span x-text="selectedTrace.ai_maturity_score"></span></div>
-          <div class="text-xs text-gray-500 mt-1"><span class="text-gray-400">Termination: </span><span x-text="selectedTrace.termination_reason"></span></div>
-          <div class="text-xs text-gray-500 mt-1"><span class="text-gray-400">Variant: </span><span x-text="selectedTrace.outbound_variant"></span></div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="batch-auto-approve" checked>
+            Auto-send (skip per-email review)
+          </label>
+          <button class="btn btn-primary" id="batch-run-btn" onclick="startBatch()">
+            <span id="batch-run-spin" style="display:none" class="btn-spinner"></span>
+            ▶ Start Batch Run
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="clearBatch()">✕ Clear</button>
         </div>
 
-        <div x-show="selectedTrace.enrichment_confidence" class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h3 class="font-semibold text-green-400 mb-3">Enrichment Confidence</h3>
-          <div class="space-y-2.5">
-            <template x-for="[src, conf] in Object.entries(selectedTrace.enrichment_confidence||{})" :key="src">
-              <div>
-                <div class="flex justify-between text-xs mb-1">
-                  <span class="capitalize" x-text="src"></span>
-                  <span x-text="Math.round(conf*100)+'%'"></span>
-                </div>
-                <div class="h-1.5 bg-gray-800 rounded-full">
-                  <div class="h-full rounded-full bg-green-500 bar" :style="'width:'+Math.round(conf*100)+'%'"></div>
-                </div>
-              </div>
-            </template>
-          </div>
-        </div>
-
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h3 class="font-semibold text-blue-400 mb-3">Email</h3>
-          <div class="text-sm mb-2"><span class="text-gray-500">Subject: </span><span x-text="selectedTrace.email_subject"></span></div>
-          <div class="flex gap-4 text-sm">
-            <span :class="selectedTrace.tone_check_passed ? 'text-green-400' : 'text-red-400'"
-              x-text="selectedTrace.tone_check_passed ? '✓ Tone Passed' : '✗ Tone Failed'"></span>
-            <span class="text-gray-500" x-text="selectedTrace.tone_check_retries+' retries'"></span>
-          </div>
+        <!-- Parsed leads preview table -->
+        <div class="tbl-wrap" style="max-height:240px;overflow-y:auto;margin-bottom:14px">
+          <table class="batch-table">
+            <thead>
+              <tr>
+                <th class="num-cell">#</th>
+                <th>Email</th>
+                <th>Company</th>
+                <th>Domain</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody id="batch-preview-tbody"></tbody>
+          </table>
         </div>
       </div>
-    </template>
 
-    <!-- ── RUN PIPELINE: job overview (no row selected) ── -->
-    <template x-if="activeTab==='run' && !selectedRunRow">
-      <div class="p-5 space-y-4">
-
-        <!-- Progress card — shown while/after job runs -->
-        <template x-if="runJob">
-          <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-            <div class="flex items-center justify-between mb-4">
-              <h2 class="font-bold text-lg">Pipeline Progress</h2>
-              <span class="text-xs px-2.5 py-1 rounded-full font-semibold"
-                :class="runJob.status==='done' ? 'bg-green-900 text-green-300' : 'bg-blue-900 text-blue-300 animate-pulse'"
-                x-text="runJob.status==='done' ? '✓ Complete' : '⏳ Running…'"></span>
-            </div>
-            <div class="grid grid-cols-4 gap-3 mb-4">
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-2xl font-bold text-white" x-text="runJob.companies.length"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Total</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-2xl font-bold text-blue-400"
-                  x-text="runJob.companies.filter(c=>c.status==='running').length"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Running</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-2xl font-bold text-green-400"
-                  x-text="runJob.companies.filter(c=>c.status==='done').length"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Done</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-3 text-center">
-                <div class="text-2xl font-bold text-red-400"
-                  x-text="runJob.companies.filter(c=>c.status==='error').length"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Failed</div>
-              </div>
-            </div>
-            <!-- Progress bar -->
-            <div>
-              <div class="flex justify-between text-xs text-gray-500 mb-1">
-                <span>Progress</span>
-                <span x-text="Math.round(runJob.companies.filter(c=>['done','error'].includes(c.status)).length / runJob.companies.length * 100) + '%'"></span>
-              </div>
-              <div class="h-2.5 bg-gray-800 rounded-full overflow-hidden">
-                <div class="h-full bg-green-500 bar rounded-full"
-                  :style="'width:' + Math.round(runJob.companies.filter(c=>['done','error'].includes(c.status)).length / runJob.companies.length * 100) + '%'"></div>
-              </div>
-            </div>
-            <!-- Pipeline stage summary when done -->
-            <template x-if="runJob.status==='done'">
-              <div class="mt-4 pt-4 border-t border-gray-800 grid grid-cols-3 gap-3 text-center text-sm">
-                <div>
-                  <div class="font-bold text-blue-400"
-                    x-text="runJob.companies.filter(c=>c.result?.email_sent).length"></div>
-                  <div class="text-xs text-gray-500">Emails Sent</div>
-                </div>
-                <div>
-                  <div class="font-bold text-orange-400"
-                    x-text="runJob.companies.filter(c=>c.result?.hubspot_contact_id).length"></div>
-                  <div class="text-xs text-gray-500">CRM Synced</div>
-                </div>
-                <div>
-                  <div class="font-bold text-purple-400"
-                    x-text="runJob.companies.filter(c=>c.result).length ? (runJob.companies.filter(c=>c.result).reduce((s,c)=>s+(c.result.ai_maturity_score||0),0)/runJob.companies.filter(c=>c.result).length).toFixed(1) : '—'"></div>
-                  <div class="text-xs text-gray-500">Avg AI Score</div>
-                </div>
-              </div>
-            </template>
+      <!-- Batch run progress -->
+      <div id="batch-progress-section" style="display:none;margin-top:14px">
+        <div class="progress-wrap">
+          <div class="progress-label">
+            <span id="batch-status-text">Running…</span>
+            <span id="batch-pct-text">0%</span>
           </div>
-        </template>
-
-        <!-- CSV format guide -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <h3 class="font-semibold text-green-400 mb-3">CSV Format Guide</h3>
-          <div class="text-sm text-gray-400 space-y-3">
-            <p>Upload a CSV with at least an <span class="font-mono text-green-300">email</span> column.
-               The domain is extracted from the email for enrichment.</p>
-            <div class="bg-gray-800 rounded-lg p-3 font-mono text-xs text-gray-300 leading-relaxed">
-              email,company_name,contact_name<br>
-              cto@stripe.com,Stripe,Patrick C.<br>
-              eng@notion.so,Notion,<br>
-              founder@seed.vc,,
-            </div>
-            <div class="grid grid-cols-2 gap-2 text-xs text-gray-500">
-              <div><span class="text-gray-300 font-mono">email</span> — required</div>
-              <div><span class="text-gray-300 font-mono">company_name</span> — display name</div>
-              <div><span class="text-gray-300 font-mono">contact_name</span> — person name</div>
-              <div><span class="text-gray-300 font-mono">domain</span> — fallback if no email</div>
-            </div>
-          </div>
-          <div class="mt-4 pt-4 border-t border-gray-800">
-            <div class="text-xs text-gray-500 font-medium mb-2">Pipeline stages per company</div>
-            <div class="flex items-center gap-1 flex-wrap">
-              <template x-for="(st, i) in ['Enrich','Signals','Segment','Comp. Gap','Email Compose','Email Send','Booking','CRM Sync']" :key="st">
-                <div class="flex items-center gap-1">
-                  <span class="text-xs bg-gray-800 text-gray-400 px-2 py-0.5 rounded" x-text="st"></span>
-                  <span x-show="i<7" class="text-gray-700 text-xs">→</span>
-                </div>
-              </template>
-            </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="batch-fill" style="width:0%"></div>
           </div>
         </div>
-
+        <div id="batch-items-list" style="margin-top:10px;max-height:260px;overflow-y:auto"></div>
       </div>
-    </template>
+    </div>
+  </div>
 
-    <!-- ── RUN PIPELINE: selected row detail ── -->
-    <template x-if="activeTab==='run' && selectedRunRow">
-      <div class="p-5 space-y-4" x-data="{openStep: null}">
-
-        <!-- Company header -->
-        <div class="bg-gray-900 rounded-xl border border-gray-800 p-5">
-          <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-            <div>
-              <h2 class="text-xl font-bold"
-                x-text="selectedRunRow.result?.company_name||selectedRunRow.company||selectedRunRow.email"></h2>
-              <div class="text-sm text-gray-500 mt-0.5" x-text="selectedRunRow.email"></div>
-            </div>
-            <span class="text-xs px-2.5 py-1 rounded-full font-semibold"
-              :class="runStatusBadge(selectedRunRow.status)" x-text="selectedRunRow.status"></span>
-          </div>
-
-          <!-- Live step indicator -->
-          <template x-if="selectedRunRow.status==='running'">
-            <div class="mt-3 flex items-center gap-2 text-sm text-blue-400">
-              <span class="w-3 h-3 border-2 border-blue-400/40 border-t-blue-400 rounded-full animate-spin shrink-0"></span>
-              <span x-text="selectedRunRow.current_step ? 'Running: '+selectedRunRow.current_step : 'Pipeline running…'"></span>
-            </div>
-          </template>
-          <template x-if="selectedRunRow.status==='pending'">
-            <div class="mt-3 text-sm text-gray-500">⏸ Waiting in queue…</div>
-          </template>
-          <template x-if="selectedRunRow.status==='error'">
-            <div class="mt-3 bg-red-950/30 border border-red-800/30 rounded-lg p-3 text-sm text-red-400"
-              x-text="selectedRunRow.error"></div>
-          </template>
-
-          <!-- Summary badges when done -->
-          <template x-if="selectedRunRow.status==='done' && selectedRunRow.result">
-            <div class="mt-4 grid grid-cols-4 gap-2">
-              <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-                <div class="font-bold" :class="aiColor(selectedRunRow.result.ai_maturity_score)"
-                  x-text="selectedRunRow.result.ai_maturity_score+'/3'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">AI Score</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-                <div class="font-bold text-purple-400 capitalize text-sm"
-                  x-text="selectedRunRow.result.segment"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Segment</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-                <div class="font-bold text-sm"
-                  :class="selectedRunRow.result.email_sent ? 'text-green-400' : 'text-red-400'"
-                  x-text="selectedRunRow.result.email_sent ? '✓ Sent' : '✗ Not Sent'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Email</div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-2.5 text-center">
-                <div class="font-bold text-sm"
-                  :class="selectedRunRow.result.booking_success ? 'text-yellow-400' : 'text-gray-600'"
-                  x-text="selectedRunRow.result.booking_success ? '✓ Booked' : '✗ Not Booked'"></div>
-                <div class="text-xs text-gray-500 mt-0.5">Booking</div>
-              </div>
-            </div>
-          </template>
-        </div>
-
-        <!-- 8-step accordion — rendered from steps array, works live too -->
-        <template x-for="(st, si) in (selectedRunRow.steps||[])" :key="st.step">
-          <div class="bg-gray-900 rounded-xl border overflow-hidden"
-            :class="st.status==='error' ? 'border-red-800/50' : 'border-gray-800'">
-            <button @click="openStep = openStep===si ? null : si"
-              class="w-full px-5 py-3.5 flex items-center justify-between hover:bg-gray-800/40 text-left">
-              <div class="flex items-center gap-3">
-                <span class="text-sm font-mono text-gray-400" x-text="(si+1)+'.'"></span>
-                <span class="font-semibold"
-                  :class="{
-                    'text-green-400':  st.step==='Enrichment',
-                    'text-teal-400':   st.step==='Signals Research',
-                    'text-purple-400': st.step==='Segment',
-                    'text-orange-400': st.step==='Competitor Gap',
-                    'text-blue-400':   st.step==='Email Compose',
-                    'text-cyan-400':   st.step==='Email Send',
-                    'text-yellow-400': st.step==='Booking',
-                    'text-pink-400':   st.step==='CRM Sync',
-                  }"
-                  x-text="st.step"></span>
-                <span class="text-xs px-2 py-0.5 rounded-full font-medium"
-                  :class="st.status==='done' ? 'bg-green-900/50 text-green-300' : st.status==='error' ? 'bg-red-900/50 text-red-300' : 'bg-gray-700 text-gray-400'"
-                  x-text="st.status==='done' ? '✓ done' : st.status==='error' ? '✗ error' : '…'"></span>
-                <span x-show="st.error" class="text-xs text-red-400 truncate max-w-xs" x-text="st.error"></span>
-              </div>
-              <svg class="w-4 h-4 text-gray-500 shrink-0 transition-transform"
-                :class="openStep===si ? 'rotate-180' : ''"
-                fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-              </svg>
-            </button>
-
-            <div x-show="openStep===si" class="px-5 pb-5 space-y-3">
-
-              <!-- ENRICHMENT detail -->
-              <template x-if="st.step==='Enrichment'">
-                <div class="space-y-3">
-                  <div class="grid grid-cols-2 gap-2 text-sm">
-                    <div class="bg-gray-800 rounded-lg p-3">
-                      <div class="text-xs text-gray-500 mb-1">Company</div>
-                      <div class="font-semibold" x-text="st.output.company_name||'—'"></div>
-                      <div class="text-xs text-gray-400 mt-0.5" x-text="st.output.domain||''"></div>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3">
-                      <div class="text-xs text-gray-500 mb-1">AI Maturity</div>
-                      <div class="font-bold text-xl" :class="aiColor(st.output.ai_maturity_score)"
-                        x-text="(st.output.ai_maturity_score??'?')+'/3'"></div>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3">
-                      <div class="text-xs text-gray-500 mb-1">Headcount</div>
-                      <div class="font-semibold text-gray-200" x-text="st.output.headcount||'N/A'"></div>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3">
-                      <div class="text-xs text-gray-500 mb-1">Funding</div>
-                      <div class="font-semibold text-yellow-400" x-text="st.output.funding_stage||'N/A'"></div>
-                    </div>
-                  </div>
-                  <div class="space-y-2">
-                    <div class="text-xs text-gray-500 uppercase tracking-wider">Signals</div>
-                    <template x-for="[key, sig] in [['crunchbase_signal',st.output.crunchbase_signal],['job_posts_signal',st.output.job_posts_signal],['layoffs_signal',st.output.layoffs_signal],['leadership_change_signal',st.output.leadership_change_signal]]" :key="key">
-                      <div x-show="sig" class="bg-gray-800 rounded-lg p-3">
-                        <div class="flex justify-between mb-1.5">
-                          <span class="text-sm capitalize" x-text="key.replace('_signal','').replace(/_/g,' ')"></span>
-                          <span class="text-xs font-mono text-gray-400" x-text="Math.round((sig?.confidence||0)*100)+'%'"></span>
-                        </div>
-                        <div class="h-1.5 bg-gray-700 rounded-full">
-                          <div class="h-full rounded-full bar"
-                            :class="(sig?.confidence||0)>0.5 ? 'bg-green-500' : 'bg-gray-500'"
-                            :style="'width:'+Math.round((sig?.confidence||0)*100)+'%'"></div>
-                        </div>
-                        <div class="text-xs text-gray-500 mt-1" x-text="sig?.source||''"></div>
-                      </div>
-                    </template>
-                  </div>
-                  <div x-show="st.output.leadership_change?.detected"
-                    class="bg-yellow-950/30 border border-yellow-800/30 rounded-lg p-3">
-                    <div class="text-xs text-yellow-400 font-medium mb-1">Leadership Change</div>
-                    <div class="text-sm text-gray-300">
-                      <span x-text="st.output.leadership_change?.changed_role"></span>
-                      · <span x-text="st.output.leadership_change?.change_type"></span>
-                      · <span x-text="(st.output.leadership_change?.days_since_change||'?')+' days ago'"></span>
-                    </div>
-                  </div>
-                </div>
-              </template>
-
-              <!-- SIGNALS RESEARCH detail -->
-              <template x-if="st.step==='Signals Research'">
-                <div class="space-y-3">
-                  <div x-show="st.output.error" class="bg-yellow-950/30 border border-yellow-800/30 rounded-lg p-3 text-xs text-yellow-400"
-                    x-text="'Scraper note: '+st.output.error"></div>
-                  <div x-show="st.output.tagline" class="bg-gray-800 rounded-lg p-3">
-                    <div class="text-xs text-gray-500 mb-1">Tagline</div>
-                    <div class="text-sm text-gray-200" x-text="st.output.tagline"></div>
-                  </div>
-                  <div x-show="st.output.recent_post" class="bg-gray-800 rounded-lg p-3">
-                    <div class="text-xs text-gray-500 mb-1">Recent Post</div>
-                    <div class="text-sm text-gray-200 italic" x-text="'&quot;'+st.output.recent_post+'&quot;'"></div>
-                  </div>
-                  <div x-show="st.output.product_hint" class="bg-gray-800 rounded-lg p-3">
-                    <div class="text-xs text-gray-500 mb-1">Product Hint</div>
-                    <div class="text-sm text-gray-200" x-text="st.output.product_hint"></div>
-                  </div>
-                  <div x-show="st.output.tech_hints?.length" class="bg-gray-800 rounded-lg p-3">
-                    <div class="text-xs text-gray-500 mb-2">Tech Stack Detected</div>
-                    <div class="flex flex-wrap gap-1.5">
-                      <template x-for="t in st.output.tech_hints||[]" :key="t">
-                        <span class="text-xs bg-teal-900/40 text-teal-300 px-2 py-0.5 rounded" x-text="t"></span>
-                      </template>
-                    </div>
-                  </div>
-                  <div x-show="st.output.personalization_hook" class="bg-teal-950/20 border border-teal-800/30 rounded-lg p-3">
-                    <div class="text-xs text-teal-400 font-medium mb-1">Personalization Hook</div>
-                    <div class="text-sm text-gray-200" x-text="st.output.personalization_hook"></div>
-                  </div>
-                  <div x-show="st.output.source_urls?.length" class="text-xs text-gray-600">
-                    <span class="text-gray-500">Scraped: </span>
-                    <template x-for="u in st.output.source_urls||[]" :key="u">
-                      <a :href="u" target="_blank" class="text-blue-500 hover:underline mr-2 break-all" x-text="u"></a>
-                    </template>
-                  </div>
-                </div>
-              </template>
-
-              <!-- SEGMENT detail -->
-              <template x-if="st.step==='Segment'">
-                <div class="space-y-3">
-                  <div class="bg-gray-800 rounded-lg p-4 text-center">
-                    <div class="text-2xl font-black text-purple-400 capitalize" x-text="st.output.segment_label"></div>
-                    <div class="text-xs text-gray-500 mt-1" x-text="'Segment ID: '+st.output.segment_id"></div>
-                  </div>
-                  <div class="grid grid-cols-2 gap-2 text-sm">
-                    <div class="bg-gray-800 rounded-lg p-3 flex items-center gap-2">
-                      <div class="w-2 h-2 rounded-full shrink-0"
-                        :class="st.output.recently_funded ? 'bg-yellow-400' : 'bg-gray-600'"></div>
-                      <span class="text-xs text-gray-400">Recently Funded</span>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3 flex items-center gap-2">
-                      <div class="w-2 h-2 rounded-full shrink-0"
-                        :class="st.output.had_layoffs ? 'bg-red-400' : 'bg-gray-600'"></div>
-                      <span class="text-xs text-gray-400">Had Layoffs (120d)</span>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3 flex items-center gap-2">
-                      <div class="w-2 h-2 rounded-full shrink-0"
-                        :class="st.output.leadership_change_detected ? 'bg-yellow-400' : 'bg-gray-600'"></div>
-                      <span class="text-xs text-gray-400">Leadership Change</span>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3 flex items-center gap-2">
-                      <div class="w-2 h-2 rounded-full shrink-0"
-                        :class="aiColor(st.output.ai_maturity_score).replace('text-','bg-')"></div>
-                      <span class="text-xs text-gray-400" x-text="'AI Maturity: '+st.output.ai_maturity_score+'/3'"></span>
-                    </div>
-                  </div>
-                  <div x-show="st.output.open_engineering_roles" class="text-xs text-gray-500">
-                    <span x-text="st.output.open_engineering_roles+' open engineering roles'"></span>
-                  </div>
-                </div>
-              </template>
-
-              <!-- COMPETITOR GAP detail -->
-              <template x-if="st.step==='Competitor Gap'">
-                <div class="space-y-3">
-                  <div x-show="st.output.recommended_angle"
-                    class="bg-orange-950/20 border border-orange-800/30 rounded-lg p-3">
-                    <div class="text-xs text-orange-400 font-medium mb-1">Recommended Angle</div>
-                    <div class="text-sm text-gray-200" x-text="st.output.recommended_angle"></div>
-                  </div>
-                  <div x-show="st.output.top_gap_summary" class="text-xs text-gray-400"
-                    x-text="st.output.top_gap_summary"></div>
-                  <template x-for="c in st.output.competitors||[]" :key="c.name">
-                    <div class="bg-gray-800 rounded-lg p-4 space-y-1.5">
-                      <div class="font-bold" x-text="c.name"></div>
-                      <div class="text-xs"><span class="text-gray-500">Positioning: </span><span class="text-gray-300" x-text="c.positioning"></span></div>
-                      <div class="text-xs"><span class="text-red-400">Gap: </span><span class="text-gray-300" x-text="c.gap"></span></div>
-                      <div class="text-xs"><span class="text-green-400">Our Advantage: </span><span class="text-gray-300" x-text="c.tenacious_advantage"></span></div>
-                    </div>
-                  </template>
-                </div>
-              </template>
-
-              <!-- EMAIL COMPOSE detail -->
-              <template x-if="st.step==='Email Compose'">
-                <div class="space-y-3">
-                  <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-xs text-gray-500 mb-1">Subject</div>
-                    <div class="font-semibold" x-text="st.output.subject||'—'"></div>
-                  </div>
-                  <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-xs text-gray-500 mb-2">Body</div>
-                    <div class="text-sm text-gray-200 whitespace-pre-wrap font-mono leading-relaxed"
-                      x-text="st.output.body||'—'"></div>
-                  </div>
-                  <div class="bg-gray-800 rounded-lg p-3">
-                    <div class="text-xs text-gray-500 mb-2">Tone Checks</div>
-                    <div class="flex gap-4 text-sm">
-                      <div class="flex items-center gap-1.5">
-                        <div class="w-2 h-2 rounded-full" :class="st.output.det_ok ? 'bg-green-500' : 'bg-red-500'"></div>
-                        Deterministic
-                      </div>
-                      <div class="flex items-center gap-1.5">
-                        <div class="w-2 h-2 rounded-full" :class="st.output.tone_check ? 'bg-green-500' : 'bg-red-500'"></div>
-                        LLM Tone
-                      </div>
-                      <div class="flex items-center gap-1.5 text-gray-400 text-xs">
-                        Confidence: <span class="font-mono ml-1" x-text="st.output.signal_confidence_avg"></span>
-                      </div>
-                    </div>
-                    <div x-show="st.output.violations?.length" class="mt-2 space-y-1">
-                      <template x-for="v in st.output.violations||[]" :key="v">
-                        <div class="text-xs text-red-400 font-mono" x-text="'· '+v"></div>
-                      </template>
-                    </div>
-                  </div>
-                </div>
-              </template>
-
-              <!-- EMAIL SEND detail -->
-              <template x-if="st.step==='Email Send'">
-                <div class="space-y-3">
-                  <div class="grid grid-cols-2 gap-2">
-                    <div class="bg-gray-800 rounded-lg p-3 text-center">
-                      <div class="font-bold text-sm"
-                        :class="st.output.sent ? 'text-green-400' : 'text-red-400'"
-                        x-text="st.output.sent ? '✓ Sent' : '✗ Failed'"></div>
-                      <div class="text-xs text-gray-500 mt-0.5">Status</div>
-                    </div>
-                    <div class="bg-gray-800 rounded-lg p-3 text-center">
-                      <div class="font-bold text-xs"
-                        :class="st.output.outbound_live ? 'text-green-400' : 'text-yellow-400'"
-                        x-text="st.output.outbound_live ? 'LIVE' : 'SINK (dev)'"></div>
-                      <div class="text-xs text-gray-500 mt-0.5">Mode</div>
-                    </div>
-                  </div>
-                  <div class="bg-gray-800 rounded-lg p-3 text-sm space-y-1.5">
-                    <div><span class="text-gray-500">To: </span><span class="font-mono text-gray-300" x-text="st.output.to"></span></div>
-                    <div><span class="text-gray-500">Routed to: </span><span class="font-mono text-gray-300" x-text="st.output.routed_to"></span></div>
-                    <div x-show="st.output.resend_id"><span class="text-gray-500">Resend ID: </span><span class="font-mono text-gray-400 text-xs" x-text="st.output.resend_id"></span></div>
-                  </div>
-                  <div x-show="st.output.error"
-                    class="bg-red-950/30 border border-red-800/30 rounded-lg p-3 text-xs text-red-400"
-                    x-text="st.output.error"></div>
-                </div>
-              </template>
-
-              <!-- BOOKING detail -->
-              <template x-if="st.step==='Booking'">
-                <div class="space-y-3">
-                  <div class="bg-gray-800 rounded-lg p-4 text-center">
-                    <div class="font-bold text-lg"
-                      :class="st.output.success ? 'text-yellow-400' : 'text-gray-600'"
-                      x-text="st.output.success ? '✓ Booked' : '✗ Not Booked'"></div>
-                  </div>
-                  <template x-if="st.output.success">
-                    <div class="bg-green-950/20 border border-green-800/30 rounded-lg p-4 space-y-2 text-sm">
-                      <div><span class="text-gray-500">Slot: </span><span class="font-medium" x-text="st.output.slot"></span></div>
-                      <div><span class="text-gray-500">URL: </span>
-                        <a :href="st.output.booking_url" target="_blank"
-                          class="text-blue-400 hover:underline break-all" x-text="st.output.booking_url"></a>
-                      </div>
-                    </div>
-                  </template>
-                  <div x-show="st.output.error"
-                    class="bg-red-950/30 border border-red-800/30 rounded-lg p-3 text-sm text-red-400"
-                    x-text="st.output.error"></div>
-                </div>
-              </template>
-
-              <!-- CRM SYNC detail -->
-              <template x-if="st.step==='CRM Sync'">
-                <div class="space-y-3">
-                  <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-xs text-gray-500 mb-1">HubSpot Contact ID</div>
-                    <div class="font-mono text-sm"
-                      :class="st.output.contact_id ? 'text-green-400' : 'text-gray-500'"
-                      x-text="st.output.contact_id||'Not synced'"></div>
-                  </div>
-                  <div x-show="st.output.error"
-                    class="bg-red-950/30 border border-red-800/30 rounded-lg p-2 text-xs text-red-400"
-                    x-text="'CRM error: '+st.output.error"></div>
-                  <div x-show="st.output.fields" class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-xs text-gray-500 mb-2">Fields Written to HubSpot</div>
-                    <div class="space-y-1.5">
-                      <template x-for="[k,v] in Object.entries(st.output.fields||{})" :key="k">
-                        <div class="flex gap-2 text-xs">
-                          <span class="font-mono text-gray-500 w-36 shrink-0" x-text="k"></span>
-                          <span class="text-gray-300 break-all" x-text="v||'—'"></span>
-                        </div>
-                      </template>
-                    </div>
-                  </div>
-                </div>
-              </template>
-
-            </div>
-          </div>
-        </template>
-
-        <!-- Empty state while pending / in-flight with no steps yet -->
-        <template x-if="!(selectedRunRow.steps||[]).length && selectedRunRow.status!=='error'">
-          <div class="text-center text-gray-600 py-8 text-sm">
-            <span x-text="selectedRunRow.status==='pending' ? '⏸ Waiting in queue…' : 'Pipeline steps will appear here as they complete.'"></span>
-          </div>
-        </template>
-
+  <!-- ── Resend Setup Guide ── -->
+  <div class="panel">
+    <div class="panel-head" onclick="togglePanel(this)">
+      <span class="panel-title"><span class="panel-icon">📬</span>Resend Inbound Email Setup Guide</span>
+      <span class="chevron">▼</span>
+    </div>
+    <div class="panel-body">
+      <div class="info-block">
+        <h4>How to configure Resend to receive prospect replies</h4>
+        <ol>
+          <li><strong>Add your domain in Resend</strong> — go to <em>Resend Dashboard → Domains → Add Domain</em>. Use a subdomain like <code>mail.yourdomain.com</code> for sending and <code>in.yourdomain.com</code> for receiving.</li>
+          <li><strong>Verify sending domain</strong> — add the DKIM + SPF DNS records Resend shows you. Wait for "Verified" status.</li>
+          <li><strong>Enable inbound</strong> — in Resend Dashboard go to <em>Email → Inbound</em>, click <em>Add Inbound</em>, choose your receiving domain (e.g. <code>in.yourdomain.com</code>).</li>
+          <li><strong>Add MX record to DNS</strong>:
+            <br><code>Type: MX | Host: in | Value: inbound.resend.com | Priority: 10</code>
+          </li>
+          <li><strong>Set webhook URL</strong> — in the inbound route config, paste your app's inbound webhook URL:
+            <br><code id="inbound-wh-url" style="user-select:all;background:var(--accent-light);padding:2px 6px;border-radius:4px;color:var(--accent)">loading…</code>
+            <br><small style="color:var(--muted)">Update <code>WEBHOOK_BASE_URL</code> in <code>.env</code> when you deploy to production.</small>
+          </li>
+          <li><strong>Add webhook secret</strong> — copy the signing secret from Resend → set <code>RESEND_WEBHOOK_SECRET=whsec_…</code> in <code>.env</code>.
+            <br><span id="wh-secret-status" style="font-size:12px"></span>
+          </li>
+          <li><strong>Set Reply-To on outbound emails</strong> — add <code>RESEND_REPLY_TO=replies@in.yourdomain.com</code> in <code>.env</code> so prospect replies route back through Resend inbound. (The app reads this env var automatically.)</li>
+          <li><strong>Go live</strong> — set <code>OUTBOUND_LIVE=true</code> to route real emails to prospects (currently in sink mode — all mail goes to <code>STAFF_SINK_EMAIL</code> for safety).</li>
+        </ol>
       </div>
-    </template>
+    </div>
+  </div>
 
-    <!-- Empty state for non-run tabs -->
-    <template x-if="(activeTab==='pipeline'&&!selectedLead)||(activeTab==='live'&&!selectedDbLead)||(activeTab==='traces'&&!selectedTrace)">
-      <div class="flex items-center justify-center h-full text-gray-700">
-        <div class="text-center">
-          <div class="text-6xl mb-3">←</div>
-          <div>Select a lead to view details</div>
-        </div>
+  <!-- ── Leads Table ── -->
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;margin-top:4px">
+    <h2 style="font-size:15px;font-weight:700">Leads</h2>
+  </div>
+  <div class="toolbar">
+    <input class="search-input" type="text" id="search"
+           placeholder="Search by email, company…" oninput="filterTable()">
+    <select id="status-filter" onchange="filterTable()">
+      <option value="">All statuses</option>
+      <option value="new">New</option>
+      <option value="outreach_sent">Outreach Sent</option>
+      <option value="in_conversation">In Conversation</option>
+      <option value="qualified">Qualified</option>
+      <option value="disqualified">Disqualified</option>
+    </select>
+  </div>
+  <div class="panel" style="margin-bottom:0">
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th><th>Company</th><th>Status</th>
+            <th>Segment</th><th>AI Score</th><th>Turns</th><th>Created</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="leads-tbody">
+          <tr><td colspan="8" class="empty-state">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<!-- ══════════════════ SIDEBAR ══════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-title">Pipeline Runs</div>
+  <div id="run-history"><div class="sidebar-empty">No runs yet.<br>Start the pipeline above.</div></div>
+</aside>
+
+</div><!-- .layout -->
+
+<!-- ── Email Approval Modal ── -->
+<div class="overlay" id="approval-overlay">
+  <div class="modal modal-lg">
+    <div class="modal-head">
+      <div>
+        <h3>Review Email Before Sending</h3>
+        <div class="sub">Edit subject or body, then approve to send — or reject to cancel the run.</div>
       </div>
-    </template>
+      <button class="close-btn" onclick="rejectEmail()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="approval-hint">
+        ✏️ You can freely edit the subject and body below before approving.
+        The pipeline will only send after you click <strong>Approve &amp; Send</strong>.
+      </div>
+      <div class="approval-to-row">
+        <span class="approval-to-label">To</span>
+        <span class="approval-to-email" id="ap-to"></span>
+        <span id="ap-sink-note" class="sink-note" style="display:none">→ redirected to sink</span>
+      </div>
+      <div class="field" style="margin-bottom:10px">
+        <label>Subject</label>
+        <input type="text" id="ap-subject">
+      </div>
+      <div class="field">
+        <label>Body</label>
+        <textarea id="ap-body" style="min-height:200px"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-danger" onclick="rejectEmail()">✗ Reject & Cancel Run</button>
+      <button class="btn btn-success" onclick="approveEmail()">
+        <span id="ap-send-spin" style="display:none" class="btn-spinner"></span>
+        ✓ Approve &amp; Send
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Lead Detail Modal ── -->
+<div class="overlay" id="lead-modal" onclick="closeLeadModal(event)">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h3 id="modal-title">Lead Detail</h3>
+        <div class="sub" id="modal-sub"></div>
+      </div>
+      <button class="close-btn" onclick="closeLeadModalDirect()">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
   </div>
 </div>
 
 <script>
-function app() {
-  return {
-    loading: false,
-    toast: null,
-    syncState: {},
-    lastUpdated: 'Never',
-    activeTab: 'pipeline',
-    search: '',
-    filterStatus: '',
-    filterSegment: '',
-    batchLeads: [],
-    dbLeads: [],
-    traces: [],
-    selectedLead: null,
-    selectedDbLead: null,
-    selectedTrace: null,
-    stats: [],
-    // Run Pipeline state
-    csvRows: [],
-    csvLimit: 5,
-    runJobId: null,
-    runJob: null,
-    runPolling: null,
-    selectedRunRow: null,
-    tabs: [
-      { id: 'pipeline', label: 'Pipeline Results', count: 0 },
-      { id: 'live',     label: 'Live Leads',       count: 0 },
-      { id: 'traces',   label: 'Eval Traces',      count: 0 },
-      { id: 'run',      label: '▶ Run Pipeline',   count: 0 },
-    ],
+'use strict';
 
-    async init() {
-      await this.refresh();
-      setInterval(() => this.refresh(), 30000);
-    },
+// ── State ─────────────────────────────────────────────────────────────────────
+let allLeads       = [];
+let currentRunId   = null;
+let pollTimer      = null;
+let approvalShown  = false;
+const TOTAL_STEPS  = 6;
+const ALL_STEPS    = ['Enrichment','Signals Research','Competitor Gap','Email Composition','Email Send','HubSpot Sync'];
 
-    async refresh() {
-      this.loading = true;
-      try {
-        const [br, dr, tr] = await Promise.all([
-          fetch('/api/batch-results').then(r => r.json()),
-          fetch('/api/db-leads').then(r => r.json()),
-          fetch('/api/traces').then(r => r.json()),
-        ]);
-        this.batchLeads = (br || []).map(l => ({
-          ...l,
-          _status: l.booking?.success       ? 'booked'
-                 : l.conversation?.qualified ? 'qualified'
-                 : (l.conversation?.reply_turns?.length||0) > 0 ? 'in_conversation'
-                 : l.email                  ? 'outreach_sent'
-                 :                            'new'
-        }));
-        this.dbLeads = Array.isArray(dr) ? dr : [];
-        this.traces  = tr || [];
-        this.tabs[0].count = this.batchLeads.length;
-        this.tabs[1].count = this.dbLeads.length;
-        this.tabs[2].count = this.traces.length;
-        this.computeStats();
-        this.lastUpdated = 'Updated ' + new Date().toLocaleTimeString();
-      } catch(e) { console.error(e); }
-      this.loading = false;
-    },
+// ── Init ──────────────────────────────────────────────────────────────────────
+// Apply server-injected config (SVRCFG is injected by the Python route handler)
+(function applyServerConfig() {
+  if (typeof SVRCFG === 'undefined') return;
+  // Outbound badge
+  const badge = document.getElementById('outbound-badge');
+  if (badge) {
+    if (SVRCFG.outboundLive) {
+      badge.className = 'outbound-badge outbound-live';
+      badge.textContent = 'LIVE MODE';
+    } else {
+      badge.className = 'outbound-badge outbound-sink';
+      badge.textContent = `SINK → ${SVRCFG.staffSink}`;
+    }
+  }
+  // Resend guide webhook URL + secret status
+  const whEl = document.getElementById('inbound-wh-url');
+  if (whEl) whEl.textContent = SVRCFG.webhookUrl;
+  const secEl = document.getElementById('wh-secret-status');
+  if (secEl) {
+    secEl.textContent = SVRCFG.secretSet
+      ? '✓ RESEND_WEBHOOK_SECRET is set — signatures will be verified.'
+      : '✗ RESEND_WEBHOOK_SECRET not set — all webhook requests are accepted (dev mode).';
+    secEl.style.color = SVRCFG.secretSet ? 'var(--green)' : 'var(--yellow)';
+  }
+})();
 
-    computeStats() {
-      const ls = this.batchLeads;
-      const emails    = ls.filter(l => l.email).length;
-      const conv      = ls.filter(l => (l.conversation?.reply_turns?.length||0) > 0).length;
-      const qualified = ls.filter(l => l.conversation?.qualified).length;
-      const booked    = ls.filter(l => l.booking?.success).length;
-      const avgAI     = ls.length ? (ls.reduce((s,l)=>s+(l.ai_maturity?.score||0),0)/ls.length).toFixed(1) : '0';
-      const toneOk    = ls.filter(l => l.email?.tone_check).length;
-      this.stats = [
-        { label:'Total',         value: ls.length,              color:'text-white' },
-        { label:'Emails Sent',   value: emails,                 color:'text-blue-400' },
-        { label:'In Conv.',      value: conv,                   color:'text-cyan-400' },
-        { label:'Qualified',     value: qualified,              color:'text-green-400' },
-        { label:'Booked',        value: booked,                 color:'text-yellow-400' },
-        { label:'Avg AI Score',  value: avgAI,                  color:'text-purple-400' },
-        { label:'Tone Pass',     value: toneOk+'/'+emails,      color:'text-pink-400' },
-      ];
-    },
+checkHealth();
+loadLeads();
+refreshHistory();
+setInterval(checkHealth, 30000);
+setInterval(refreshHistory, 5000);
 
-    get filteredBatch() {
-      return this.batchLeads.filter(l => {
-        const name  = (l.input?.name || l.enrichment?.company_name || '').toLowerCase();
-        const email = (l.input?.contact_email || '').toLowerCase();
-        const q = this.search.toLowerCase();
-        return (!q || name.includes(q) || email.includes(q))
-            && (!this.filterStatus  || l._status === this.filterStatus)
-            && (!this.filterSegment || l.segment?.label === this.filterSegment);
-      });
-    },
+// ── Health ────────────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    if (d.status === 'ok') {
+      document.getElementById('hDot').classList.add('ok');
+      document.getElementById('hLabel').textContent = 'Live';
+    }
+  } catch(_) {}
+}
 
-    get filteredDb() {
-      return this.dbLeads.filter(l => {
-        const name = (l.profile?.company_name || l.email || '').toLowerCase();
-        const q = this.search.toLowerCase();
-        return (!q || name.includes(q) || l.email.includes(q))
-            && (!this.filterStatus || l.status === this.filterStatus);
-      });
-    },
+// ── Leads ─────────────────────────────────────────────────────────────────────
+async function loadLeads() {
+  const res = await fetch('/api/leads');
+  allLeads  = await res.json();
+  updateStats(allLeads);
+  renderTable(allLeads);
+}
 
-    get filteredTraces() {
-      return this.traces.filter(t => {
-        const q = this.search.toLowerCase();
-        return (!q || t.trace_id.includes(q) || (t.segment||'').includes(q))
-            && (!this.filterSegment || t.segment === this.filterSegment);
-      });
-    },
+function updateStats(leads) {
+  const cnt = {new:0, outreach_sent:0, in_conversation:0, qualified:0, disqualified:0};
+  leads.forEach(l => { cnt[l.status] = (cnt[l.status]||0) + 1; });
+  document.getElementById('s-total').textContent = leads.length;
+  document.getElementById('s-new').textContent   = cnt.new;
+  document.getElementById('s-sent').textContent  = cnt.outreach_sent;
+  document.getElementById('s-conv').textContent  = cnt.in_conversation;
+  document.getElementById('s-qual').textContent  = cnt.qualified;
+  document.getElementById('s-disq').textContent  = cnt.disqualified;
+}
 
-    statusBadge(s) {
-      return { new:'bg-gray-700 text-gray-300', outreach_sent:'bg-blue-900/60 text-blue-300',
-               in_conversation:'bg-cyan-900/60 text-cyan-300', qualified:'bg-green-900/60 text-green-300',
-               disqualified:'bg-red-900/60 text-red-300', booked:'bg-yellow-900/60 text-yellow-300' }[s]
-             || 'bg-gray-700 text-gray-300';
-    },
+function statusBadge(s) {
+  const map = {
+    new:             ['badge-new',  'New'],
+    outreach_sent:   ['badge-sent', 'Sent'],
+    in_conversation: ['badge-conv', 'In Convo'],
+    qualified:       ['badge-qual', 'Qualified'],
+    disqualified:    ['badge-disq', 'Disqualified'],
+  };
+  const [cls, lbl] = map[s] || ['badge-new', s];
+  return `<span class="badge ${cls}">${lbl}</span>`;
+}
 
-    aiColor(s) {
-      return s>=3 ? 'text-green-400' : s>=2 ? 'text-yellow-400' : s>=1 ? 'text-orange-400' : 'text-red-400';
-    },
+function scoreDot(n) {
+  const cls = ['s0','s1','s2','s3','s4'][Math.min(n||0, 4)];
+  return `<span class="score"><span class="score-dot ${cls}"></span>${n||0}</span>`;
+}
 
-    enrichSignals(lead) {
-      if (!lead?.enrichment) return [];
-      const e = lead.enrichment;
-      return [
-        { name:'Crunchbase',         conf: e.crunchbase_signal?.confidence||0,         source: e.crunchbase_signal?.source||'?' },
-        { name:'Job Posts',          conf: e.job_posts_signal?.confidence||0,          source: e.job_posts_signal?.source||'?' },
-        { name:'Layoffs.fyi',        conf: e.layoffs_signal?.confidence||0,            source: e.layoffs_signal?.source||'?' },
-        { name:'Leadership (PDL)',   conf: e.leadership_change_signal?.confidence||0,  source: e.leadership_change_signal?.source||'?' },
-      ];
-    },
+function fmtDate(s) {
+  if (!s) return '—';
+  return s.replace('T',' ').replace('Z','').slice(0,16);
+}
 
-    pipelineStages(lead) {
-      return [
-        { name:'Enrich',   done: !!lead.enrichment },
-        { name:'Email',    done: !!lead.email },
-        { name:'Converse', done: (lead.conversation?.reply_turns?.length||0)>0 },
-        { name:'Qualify',  done: !!lead.conversation?.qualified },
-        { name:'Book',     done: !!lead.booking?.success },
-        { name:'CRM',      done: !!lead.hubspot?.contact_id },
-      ];
-    },
+function b64(email) { return btoa(email).replace(/=/g,''); }
 
-    showToast(type, msg) {
-      this.toast = { type, message: msg };
-      setTimeout(() => this.toast = null, 4500);
-    },
+function renderTable(leads) {
+  const tbody = document.getElementById('leads-tbody');
+  if (!leads.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No leads yet. Run the pipeline to get started.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = leads.map(l => `
+    <tr onclick="openLeadModal('${l.email.replace(/'/g,"\\'")}')">
+      <td class="email-cell">${l.email}</td>
+      <td class="company-cell">${l.company_name || '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${statusBadge(l.status)}</td>
+      <td style="font-size:12px;color:var(--muted)">${(l.segment_label||'generic').replace(/_/g,' ')}</td>
+      <td>${scoreDot(l.ai_maturity_score)}</td>
+      <td style="color:var(--muted)">${l.turns}</td>
+      <td style="font-size:12px;color:var(--muted)">${fmtDate(l.created_at)}</td>
+      <td onclick="event.stopPropagation()">
+        <button class="btn btn-danger btn-sm" onclick="deleteLead('${l.email.replace(/'/g,"\\'")}')">✕</button>
+      </td>
+    </tr>`).join('');
+}
 
-    async syncBooking(slug) {
-      if (!this.syncState[slug]) this.syncState[slug] = {};
-      this.syncState[slug].booking = 'loading';
-      try {
-        const r = await fetch('/api/sync-booking/' + slug, { method: 'POST' }).then(x => x.json());
-        if (r.success) {
-          this.selectedLead.booking = r;
-          this.selectedLead._status = 'booked';
-          const idx = this.batchLeads.findIndex(l => l._slug === slug);
-          if (idx >= 0) { this.batchLeads[idx].booking = r; this.batchLeads[idx]._status = 'booked'; }
-          this.showToast('success', 'Booked: ' + (r.slot || r.booking_url));
-          this.syncState[slug].booking = 'ok';
-        } else {
-          this.showToast('error', 'Booking failed: ' + (r.error || 'unknown error'));
-          this.syncState[slug].booking = 'error';
-        }
-      } catch(e) {
-        this.showToast('error', 'Request failed: ' + e.message);
-        this.syncState[slug].booking = 'error';
-      }
-    },
+function filterTable() {
+  const q  = document.getElementById('search').value.toLowerCase();
+  const sf = document.getElementById('status-filter').value;
+  renderTable(allLeads.filter(l => {
+    const mQ  = !q  || l.email.toLowerCase().includes(q) || (l.company_name||'').toLowerCase().includes(q);
+    const mSF = !sf || l.status === sf;
+    return mQ && mSF;
+  }));
+}
 
-    async syncCRM(slug) {
-      if (!this.syncState[slug]) this.syncState[slug] = {};
-      this.syncState[slug].crm = 'loading';
-      try {
-        const r = await fetch('/api/sync-crm/' + slug, { method: 'POST' }).then(x => x.json());
-        if (r.success) {
-          if (this.selectedLead.hubspot) this.selectedLead.hubspot.contact_id = r.contact_id;
-          else this.selectedLead.hubspot = { contact_id: r.contact_id, fields: {} };
-          this.showToast('success', 'CRM synced · contact #' + r.contact_id);
-          this.syncState[slug].crm = 'ok';
-        } else {
-          this.showToast('error', 'CRM sync failed: ' + (r.error || 'unknown error'));
-          this.syncState[slug].crm = 'error';
-        }
-      } catch(e) {
-        this.showToast('error', 'Request failed: ' + e.message);
-        this.syncState[slug].crm = 'error';
-      }
-    },
+async function deleteLead(email) {
+  if (!confirm(`Delete lead ${email}?`)) return;
+  await fetch(`/api/leads/${b64(email)}`, {method:'DELETE'});
+  await loadLeads();
+}
 
-    async syncBookingDb(email) {
-      const key = 'db:' + email;
-      if (!this.syncState[key]) this.syncState[key] = {};
-      this.syncState[key].booking = 'loading';
-      try {
-        const r = await fetch('/api/sync-booking-db', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email}) }).then(x => x.json());
-        if (r.success) {
-          this.selectedDbLead.booking_url = r.booking_url;
-          this.showToast('success', 'Booked: ' + (r.slot || r.booking_url));
-          this.syncState[key].booking = 'ok';
-        } else {
-          this.showToast('error', 'Booking failed: ' + (r.error || 'unknown error'));
-          this.syncState[key].booking = 'error';
-        }
-      } catch(e) {
-        this.showToast('error', 'Request failed: ' + e.message);
-        this.syncState[key].booking = 'error';
-      }
-    },
+// ── Lead Modal ────────────────────────────────────────────────────────────────
+async function openLeadModal(email) {
+  const res = await fetch(`/api/leads/${b64(email)}`);
+  const l   = await res.json();
+  document.getElementById('modal-title').textContent = l.company_name || email;
+  document.getElementById('modal-sub').textContent   = email;
+  const p = l.profile || {};
+  const rows = [
+    ['Status',      statusBadge(l.status)],
+    ['Lead ID',     `<code style="font-size:11px">${l.lead_id}</code>`],
+    ['Phone',       l.phone || '—'],
+    ['HubSpot ID',  l.hubspot_contact_id || '—'],
+    ['Domain',      l.domain || '—'],
+    ['Segment',     (l.segment_label||'generic').replace(/_/g,' ')],
+    ['AI Maturity', scoreDot(l.ai_maturity_score)],
+    ['Turns',       l.turns],
+    ['Enriched',    fmtDate(l.enriched_at)],
+    ['Created',     fmtDate(l.created_at)],
+    ['Booking',     l.booking_url ? `<a href="${l.booking_url}" target="_blank" style="color:var(--accent)">${l.booking_url}</a>` : '—'],
+  ];
+  let html = `<div class="kv-grid">${rows.map(([k,v])=>`<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')}</div>`;
+  if (l.history && l.history.length) {
+    html += `<div class="section-label">Conversation (${l.history.length} turns)</div>`;
+    html += l.history.map(m=>`<div class="history-item"><div class="role role-${m.role}">${m.role}</div><div class="msg">${m.content||m.text||JSON.stringify(m)}</div></div>`).join('');
+  }
+  if (p.competitor_gap_brief) {
+    html += `<div class="section-label">Competitor Gap Brief</div><div class="json-block">${p.competitor_gap_brief}</div>`;
+  }
+  if (p.signals_research) {
+    html += `<div class="section-label">Signals Research</div><div class="json-block">${JSON.stringify(p.signals_research,null,2)}</div>`;
+  }
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('lead-modal').classList.add('open');
+}
+function closeLeadModal(e) { if (e.target.id==='lead-modal') closeLeadModalDirect(); }
+function closeLeadModalDirect() { document.getElementById('lead-modal').classList.remove('open'); }
 
-    async syncCrmDb(email) {
-      const key = 'db:' + email;
-      if (!this.syncState[key]) this.syncState[key] = {};
-      this.syncState[key].crm = 'loading';
-      try {
-        const r = await fetch('/api/sync-crm-db', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email}) }).then(x => x.json());
-        if (r.success) {
-          this.showToast('success', 'CRM synced · contact #' + r.contact_id);
-          this.syncState[key].crm = 'ok';
-        } else {
-          this.showToast('error', 'CRM sync failed: ' + (r.error || 'unknown error'));
-          this.syncState[key].crm = 'error';
-        }
-      } catch(e) {
-        this.showToast('error', 'Request failed: ' + e.message);
-        this.syncState[key].crm = 'error';
-      }
-    },
+// ── Panel toggle ──────────────────────────────────────────────────────────────
+function togglePanel(head) {
+  head.classList.toggle('open');
+  head.nextElementSibling.classList.toggle('open');
+}
 
-    // ── Run Pipeline ────────────────────────────────────────────────────────
-    async uploadCSV(e) {
-      const file = e.target.files[0];
-      if (!file) return;
-      const fd = new FormData();
-      fd.append('file', file);
-      try {
-        const rows = await fetch('/api/upload-csv', { method:'POST', body:fd }).then(r => r.json());
-        this.csvRows = Array.isArray(rows) ? rows : [];
-        this.runJob = null;
-        this.runJobId = null;
-        this.selectedRunRow = null;
-        this.tabs[3].count = this.csvRows.length;
-        this.showToast('success', `Loaded ${this.csvRows.length} companies from CSV`);
-      } catch(err) {
-        this.showToast('error', 'CSV upload failed: ' + err.message);
-      }
-    },
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+async function startPipeline() {
+  const email = document.getElementById('pipe-email').value.trim();
+  const text  = document.getElementById('pipe-text').value.trim();
+  if (!email) { alert('Lead email is required'); return; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  approvalShown = false;
 
-    async startPipeline() {
-      if (!this.csvRows.length) { this.showToast('error', 'Upload a CSV first'); return; }
-      if (this.runJob?.status === 'running') { this.showToast('error', 'Pipeline already running'); return; }
-      try {
-        const r = await fetch('/api/start-pipeline', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rows: this.csvRows, limit: this.csvLimit }),
-        }).then(x => x.json());
-        if (!r.job_id) { this.showToast('error', 'Failed to start'); return; }
-        this.runJobId = r.job_id;
-        this.runJob   = null;
-        this.selectedRunRow = null;
-        if (this.runPolling) clearInterval(this.runPolling);
-        this.runPolling = setInterval(() => this.pollPipeline(), 2000);
-        this.showToast('success', `Pipeline started for ${r.count} companies`);
-      } catch(err) {
-        this.showToast('error', 'Start failed: ' + err.message);
-      }
-    },
+  // Reset UI
+  document.getElementById('pipe-btn').disabled = true;
+  document.getElementById('pipe-spin').style.display = 'inline-block';
+  document.getElementById('pipe-progress-wrap').style.display = 'block';
+  document.getElementById('pipe-fill').style.width = '0%';
+  document.getElementById('pipe-pct').textContent = '0%';
+  document.getElementById('pipe-status-text').textContent = 'Starting…';
+  document.getElementById('pipe-msg').textContent = '';
+  renderSteps({}, []);
 
-    async pollPipeline() {
-      if (!this.runJobId) return;
-      try {
-        const job = await fetch('/api/pipeline-status/' + this.runJobId).then(r => r.json());
-        this.runJob = job;
-        // keep selectedRunRow in sync with latest data
-        if (this.selectedRunRow) {
-          const fresh = job.companies.find(c => c.email === this.selectedRunRow.email);
-          if (fresh) this.selectedRunRow = fresh;
-        }
-        if (job.status === 'done') {
-          clearInterval(this.runPolling);
-          this.runPolling = null;
-          await this.refresh();
-          const done = job.companies.filter(c => c.status === 'done').length;
-          const errs = job.companies.filter(c => c.status === 'error').length;
-          this.showToast('success', `Pipeline complete — ${done} OK, ${errs} failed`);
-        }
-      } catch(_e) {}
-    },
+  const res = await fetch('/api/pipeline/run', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({email, text: text||'Tell me more.'})
+  });
+  const {run_id} = await res.json();
+  currentRunId = run_id;
+  pollTimer = setInterval(()=>pollRun(run_id), 1000);
+}
 
-    get runCompanies() {
-      if (this.runJob) return this.runJob.companies;
-      return this.csvRows.map(r => ({ ...r, status:'pending', result:null, error:'' }));
-    },
+async function pollRun(run_id) {
+  try {
+    const res = await fetch(`/api/pipeline/${run_id}`);
+    if (!res.ok) return;
+    const run = await res.json();
+    updatePipelineUI(run);
 
-    runStatusBadge(s) {
-      return { pending:'bg-gray-700 text-gray-400', running:'bg-blue-800 text-blue-200 animate-pulse',
-               done:'bg-green-900 text-green-300', error:'bg-red-900 text-red-300' }[s]
-             || 'bg-gray-700 text-gray-400';
-    },
+    if (run.status === 'awaiting_approval' && !approvalShown) {
+      approvalShown = true;
+      showApprovalModal(run.email_draft);
+    }
+
+    if (['completed','failed','rejected'].includes(run.status)) {
+      clearInterval(pollTimer); pollTimer = null;
+      document.getElementById('pipe-btn').disabled = false;
+      document.getElementById('pipe-spin').style.display = 'none';
+      refreshHistory();
+      loadLeads();
+    }
+  } catch(e) { console.error('poll error', e); }
+}
+
+function updatePipelineUI(run) {
+  const steps = run.steps || {};
+  let doneW = 0;
+  ALL_STEPS.forEach(n => {
+    const s = steps[n];
+    if (!s) return;
+    if (s.status === 'done') doneW += 1;
+    else if (s.status === 'running') doneW += 0.5;
+    else if (s.status === 'awaiting_approval') doneW += 0.7;
+    else if (s.status === 'error' || s.status === 'rejected') doneW += 1;
+  });
+  const pct = Math.min(Math.round((doneW / TOTAL_STEPS) * 100), 100);
+  document.getElementById('pipe-fill').style.width = pct + '%';
+  document.getElementById('pipe-pct').textContent  = pct + '%';
+
+  const msgMap = {
+    completed:         '✓ Pipeline complete!',
+    failed:            `✗ Failed: ${run.error||'unknown error'}`,
+    rejected:          '✗ Email rejected — run cancelled.',
+    awaiting_approval: '⏸ Waiting for your email approval…',
+    approved:          '↻ Sending email…',
+    running:           '↻ Running…',
+    pending:           'Starting…',
+  };
+  document.getElementById('pipe-status-text').textContent = msgMap[run.status] || run.status;
+  renderSteps(steps, run.step_order || []);
+}
+
+function renderSteps(steps, stepOrder) {
+  const iconMap = {
+    pending:           ['○', '—'],
+    running:           [`<span class="spin">↻</span>`, 'Running'],
+    done:              ['✓', 'Done'],
+    error:             ['✗', 'Error'],
+    awaiting_approval: ['⏸', 'Review'],
+    rejected:          ['✗', 'Rejected'],
+  };
+  document.getElementById('pipe-steps').innerHTML = ALL_STEPS.map(name => {
+    const step   = steps[name];
+    const status = step ? step.status : 'pending';
+    const [icon, badge] = iconMap[status] || ['○', status];
+    let detail = '';
+    if (step && step.data) {
+      const vals = Object.values(step.data);
+      if (vals.length) detail = String(vals[0]).slice(0, 70);
+    }
+    if (step && step.error) detail = step.error.slice(0, 70);
+    return `<div class="step-card s-${status}">
+      <div class="step-icon-wrap s-${status}">${icon}</div>
+      <div class="step-content">
+        <div class="step-name">${name}</div>
+        ${detail ? `<div class="step-detail">${detail}</div>` : ''}
+      </div>
+      <span class="step-badge s-${status}">${badge}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── Email Approval ────────────────────────────────────────────────────────────
+function showApprovalModal(draft) {
+  if (!draft) return;
+  window._pendingDraft = draft;
+  document.getElementById('ap-to').textContent      = draft.to;
+  document.getElementById('ap-subject').value       = draft.subject || '';
+  document.getElementById('ap-body').value          = draft.body   || '';
+  const sinkNote = document.getElementById('ap-sink-note');
+  const isLive = typeof SVRCFG !== 'undefined' ? SVRCFG.outboundLive
+               : document.getElementById('outbound-badge').classList.contains('outbound-live');
+  sinkNote.style.display = isLive ? 'none' : 'inline-flex';
+  document.getElementById('approval-banner').classList.add('show');
+  document.getElementById('approval-overlay').classList.add('open');
+  // Scroll the modal into view in case user has scrolled down
+  document.getElementById('approval-overlay').scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+async function approveEmail() {
+  if (!currentRunId) return;
+  const subject = document.getElementById('ap-subject').value.trim();
+  const body    = document.getElementById('ap-body').value.trim();
+  if (!subject || !body) { alert('Subject and body cannot be empty.'); return; }
+  document.getElementById('ap-send-spin').style.display = 'inline-block';
+  try {
+    const res = await fetch(`/api/pipeline/${currentRunId}/approve`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({subject, body})
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(()=>({error:String(res.status)}));
+      alert(`Approval failed: ${err.error || res.status}`);
+      document.getElementById('ap-send-spin').style.display = 'none';
+      return;
+    }
+  } catch(e) {
+    alert(`Network error: ${e.message}`);
+    document.getElementById('ap-send-spin').style.display = 'none';
+    return;
+  }
+  document.getElementById('ap-send-spin').style.display = 'none';
+  document.getElementById('approval-banner').classList.remove('show');
+  document.getElementById('approval-overlay').classList.remove('open');
+  approvalShown = false;
+  window._pendingDraft = null;
+}
+
+async function rejectEmail() {
+  if (currentRunId) {
+    if (!confirm('Reject this email? The pipeline run will be cancelled.')) return;
+    await fetch(`/api/pipeline/${currentRunId}/reject`, {method:'POST'});
+  }
+  document.getElementById('approval-banner').classList.remove('show');
+  document.getElementById('approval-overlay').classList.remove('open');
+  approvalShown = false;
+  window._pendingDraft = null;
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+async function refreshHistory() {
+  const res = await fetch('/api/pipeline/history');
+  const hist = await res.json();
+  renderHistory(hist);
+  // Check live badge
+  const res2 = await fetch('/health').catch(()=>null);
+  // outbound-live badge is set server-side on page load via the HTML attribute
+}
+
+function renderHistory(history) {
+  const el = document.getElementById('run-history');
+  if (!history.length) {
+    el.innerHTML = '<div class="sidebar-empty">No runs yet.<br>Start the pipeline above.</div>';
+    return;
+  }
+  el.innerHTML = history.map(run => {
+    const statusPill = {
+      completed: 'rp-completed', failed: 'rp-failed',
+      rejected:  'rp-rejected',  running: 'rp-running',
+      awaiting_approval: 'rp-awaiting', pending: 'rp-pending',
+    }[run.status] || 'rp-pending';
+    const statusLabel = {
+      completed: '✓ Done', failed: '✗ Failed',
+      rejected:  'Rejected', running: '↻ Running',
+      awaiting_approval: '⏸ Waiting', pending: 'Pending',
+    }[run.status] || run.status;
+    const elapsed = run.completed_at && run.started_at
+      ? ((run.completed_at - run.started_at).toFixed(1) + 's')
+      : 'in progress';
+    const ts = run.started_at
+      ? new Date(run.started_at * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
+      : '';
+    let detailHtml = '';
+    if (run.error) detailHtml += `<div class="run-error-msg">Error: ${run.error}</div>`;
+    if (run.result) {
+      const r = run.result;
+      detailHtml += `<pre class="run-result-pre">${JSON.stringify(r,null,2).slice(0,300)}</pre>`;
+    }
+    if (run.gap_brief) {
+      detailHtml += `<div class="run-gap-preview">${run.gap_brief.slice(0,180)}…</div>`;
+    }
+    return `<div class="run-card">
+      <div class="run-card-head" onclick="toggleRunDetail('${run.run_id}')">
+        <div class="run-email">${run.email}</div>
+        <div class="run-meta">
+          <span class="run-time">${ts} · ${elapsed}</span>
+          <span class="run-status-pill ${statusPill}">${statusLabel}</span>
+        </div>
+      </div>
+      ${detailHtml ? `<div class="run-detail" id="rd-${run.run_id}">${detailHtml}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function toggleRunDetail(runId) {
+  const el = document.getElementById(`rd-${runId}`);
+  if (el) el.classList.toggle('open');
+}
+
+// ── Email Outreach Panel ──────────────────────────────────────────────────────
+let emTraceId = '';
+async function composeEmail() {
+  const email = document.getElementById('em-email').value.trim();
+  if (!email) { alert('Lead email required'); return; }
+  setBtnLoading('em-compose-btn','em-compose-spin',true);
+  document.getElementById('em-draft-wrap').style.display = 'none';
+  document.getElementById('em-result').className = 'result-box';
+  try {
+    const res  = await fetch('/api/email/compose', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Compose failed');
+    document.getElementById('em-to').textContent      = data.to;
+    document.getElementById('em-subject').value       = data.subject;
+    document.getElementById('em-body').value          = data.body;
+    emTraceId = data.trace_id;
+    const isLive = typeof SVRCFG !== 'undefined' ? SVRCFG.outboundLive
+                 : document.getElementById('outbound-badge').classList.contains('outbound-live');
+    document.getElementById('em-sink-note').style.display = isLive ? 'none' : 'inline-flex';
+    document.getElementById('em-draft-wrap').style.display = 'block';
+  } catch(e) {
+    showResult('em-result', String(e), true);
+  } finally {
+    setBtnLoading('em-compose-btn','em-compose-spin',false);
   }
 }
+
+async function sendComposedEmail() {
+  const to      = document.getElementById('em-to').textContent.trim();
+  const subject = document.getElementById('em-subject').value.trim();
+  const body    = document.getElementById('em-body').value.trim();
+  if (!to || !subject || !body) { alert('Subject and body required'); return; }
+  setBtnLoading(null,'em-send-spin',true);
+  try {
+    const res  = await fetch('/api/email/send', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({to, subject, body, trace_id: emTraceId})
+    });
+    const data = await res.json();
+    showResult('em-result', JSON.stringify(data,null,2), !res.ok);
+    if (res.ok) {
+      document.getElementById('em-draft-wrap').style.display = 'none';
+      loadLeads();
+    }
+  } catch(e) {
+    showResult('em-result', String(e), true);
+  } finally {
+    setBtnLoading(null,'em-send-spin',false);
+  }
+}
+
+// ── Gap Analysis Panel ────────────────────────────────────────────────────────
+async function analyzeGap() {
+  const email = document.getElementById('gap-email').value.trim();
+  if (!email) { alert('Lead email required'); return; }
+  await callPanelApi('/api/gap/analyze', {email}, 'gap-btn', 'gap-spin', 'gap-result');
+}
+
+// ── CRM Panel ─────────────────────────────────────────────────────────────────
+async function syncCRM() {
+  const email = document.getElementById('crm-email').value.trim();
+  if (!email) { alert('Lead email required'); return; }
+  await callPanelApi('/api/crm/sync', {email}, 'crm-btn', 'crm-spin', 'crm-result');
+}
+
+// ── SMS Panel ─────────────────────────────────────────────────────────────────
+async function simulateSMS() {
+  const email = document.getElementById('sms-email').value.trim();
+  const phone = document.getElementById('sms-phone').value.trim();
+  const text  = document.getElementById('sms-text').value.trim();
+  if (!email || !phone) { alert('Email and phone required'); return; }
+  await callPanelApi('/simulate/sms', {email, phone, text: text||"Yes, let's talk."}, 'sms-btn','sms-spin','sms-result');
+  loadLeads();
+}
+
+// ── Reply Panel ───────────────────────────────────────────────────────────────
+async function simulateReply() {
+  const email = document.getElementById('reply-email').value.trim();
+  const text  = document.getElementById('reply-text').value.trim();
+  if (!email || !text) { alert('Email and text required'); return; }
+  await callPanelApi('/webhooks/email', {from:email, text, thread_id:'dashboard-reply'}, 'reply-btn','reply-spin','reply-result');
+  loadLeads();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function showResult(id, text, isError) {
+  const el = document.getElementById(id);
+  el.textContent  = text;
+  el.className    = 'result-box visible' + (isError ? ' error' : '');
+}
+
+function setBtnLoading(btnId, spinId, on) {
+  if (btnId) document.getElementById(btnId).disabled = on;
+  if (spinId) document.getElementById(spinId).style.display = on ? 'inline-block' : 'none';
+}
+
+async function callPanelApi(endpoint, payload, btnId, spinId, resultId) {
+  setBtnLoading(btnId, spinId, true);
+  document.getElementById(resultId).className = 'result-box';
+  try {
+    const res  = await fetch(endpoint, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    showResult(resultId, JSON.stringify(data,null,2), !res.ok);
+  } catch(e) {
+    showResult(resultId, String(e), true);
+  } finally {
+    setBtnLoading(btnId, spinId, false);
+  }
+}
+
+// ── Batch Upload ──────────────────────────────────────────────────────────────
+let batchLeads   = [];
+let batchPollTmr = null;
+
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById('upload-zone').classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadBatchFile(file);
+}
+function handleFileSelect(e) {
+  const file = e.target.files[0];
+  if (file) uploadBatchFile(file);
+  e.target.value = '';
+}
+
+async function uploadBatchFile(file) {
+  const errEl = document.getElementById('batch-parse-error');
+  errEl.style.display = 'none';
+  document.getElementById('batch-preview').style.display = 'none';
+  document.getElementById('batch-progress-section').style.display = 'none';
+  const zone = document.getElementById('upload-zone');
+  zone.querySelector('.upload-label').textContent = `Parsing ${file.name}…`;
+
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res  = await fetch('/api/batch/parse', {method:'POST', body: fd});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Parse failed');
+    batchLeads = data.leads;
+    zone.querySelector('.upload-label').textContent = `${file.name} — ${data.count} entries found`;
+    renderBatchPreview(data.leads);
+  } catch(e) {
+    zone.querySelector('.upload-label').textContent = 'Drop file here or click to browse';
+    errEl.textContent = String(e);
+    errEl.style.display = 'block';
+  }
+}
+
+function renderBatchPreview(leads) {
+  document.getElementById('batch-count-badge').textContent = `${leads.length} companies`;
+  document.getElementById('batch-n').max   = leads.length;
+  document.getElementById('batch-n').value = Math.min(leads.length, 5);
+  const tbody = document.getElementById('batch-preview-tbody');
+  tbody.innerHTML = leads.map((l,i) => `
+    <tr>
+      <td class="num-cell">${i+1}</td>
+      <td class="email-cell">${l.email}</td>
+      <td>${l.company || '<span style="color:var(--muted)">—</span>'}</td>
+      <td style="font-size:12px;color:var(--muted)">${l.domain}</td>
+      <td><span class="badge ${l.source==='direct'?'badge-qual':l.source==='synthesized'?'badge-conv':'badge-sent'}">${l.source}</span></td>
+    </tr>`).join('');
+  document.getElementById('batch-preview').style.display = 'block';
+}
+
+async function startBatch() {
+  if (!batchLeads.length) { alert('No leads loaded'); return; }
+  const n          = parseInt(document.getElementById('batch-n').value) || 1;
+  const autoApprove = document.getElementById('batch-auto-approve').checked;
+  if (!autoApprove) {
+    alert('Manual approval for batch is not yet supported. Please enable "Auto-send" for batch runs.');
+    return;
+  }
+  setBtnLoading('batch-run-btn','batch-run-spin',true);
+  document.getElementById('batch-progress-section').style.display = 'block';
+  document.getElementById('batch-items-list').innerHTML = '';
+  document.getElementById('batch-fill').style.width = '0%';
+  document.getElementById('batch-pct-text').textContent = '0%';
+  document.getElementById('batch-status-text').textContent = 'Starting…';
+
+  const res = await fetch('/api/batch/run', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({leads: batchLeads, n})
+  });
+  const data = await res.json();
+  if (!res.ok) { alert(data.error); setBtnLoading('batch-run-btn','batch-run-spin',false); return; }
+
+  batchPollTmr = setInterval(pollBatch, 1500);
+}
+
+async function pollBatch() {
+  try {
+    const res  = await fetch('/api/batch/status');
+    const data = await res.json();
+    updateBatchUI(data);
+    if (data.status === 'completed' || data.status === 'failed') {
+      clearInterval(batchPollTmr); batchPollTmr = null;
+      setBtnLoading('batch-run-btn','batch-run-spin',false);
+      loadLeads();
+      refreshHistory();
+    }
+  } catch(e) { console.error('batch poll error', e); }
+}
+
+function updateBatchUI(data) {
+  const total = data.total || 1;
+  const done  = data.done + data.failed_count;
+  const pct   = Math.min(Math.round((done / total) * 100), 100);
+  document.getElementById('batch-fill').style.width = pct + '%';
+  document.getElementById('batch-pct-text').textContent = pct + '%';
+
+  const statusMap = {
+    running:   `↻ Running — ${data.done}/${total} done, ${data.failed_count} failed` + (data.current ? ` | current: ${data.current}` : ''),
+    completed: `✓ Batch complete — ${data.done} done, ${data.failed_count} failed`,
+    failed:    `✗ Batch failed`,
+    idle:      'Idle',
+  };
+  document.getElementById('batch-status-text').textContent = statusMap[data.status] || data.status;
+
+  const listEl = document.getElementById('batch-items-list');
+  listEl.innerHTML = (data.latest_results || []).slice().reverse().map(r => {
+    const isOk = r.status === 'ok';
+    return `<div class="batch-item">
+      <span class="bi-email">${r.email}</span>
+      <span class="bi-status ${isOk?'bi-ok':'bi-error'}">${isOk?'✓ Sent':'✗ Error'}</span>
+      ${!isOk ? `<span style="font-size:11px;color:var(--red)">${(r.error||'').slice(0,60)}</span>` : ''}
+    </div>`;
+  }).join('') + (data.current && data.status === 'running' ? `
+    <div class="batch-item">
+      <span class="bi-email">${data.current}</span>
+      <span class="bi-status bi-running"><span class="spin">↻</span> Running</span>
+    </div>` : '');
+}
+
+function clearBatch() {
+  batchLeads = [];
+  document.getElementById('batch-preview').style.display = 'none';
+  document.getElementById('batch-progress-section').style.display = 'none';
+  document.getElementById('upload-zone').querySelector('.upload-label').textContent = 'Drop file here or click to browse';
+  document.getElementById('batch-parse-error').style.display = 'none';
+}
+
+// ── Outbound badge ────────────────────────────────────────────────────────────
+(async function detectOutboundMode() {
+  try {
+    await fetch('/health');
+    // Badge stays "SINK MODE" by default — set OUTBOUND_LIVE=true in .env to switch
+  } catch(_){}
+})();
 </script>
 </body>
 </html>"""
 
 
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    base = os.getenv("WEBHOOK_BASE_URL", "https://your-app.onrender.com").rstrip("/")
+    webhook_url = f"{base}/webhooks/email"
+    secret_set = "true" if os.getenv("RESEND_WEBHOOK_SECRET") else "false"
+    live = "true" if _OUTBOUND_LIVE else "false"
+    sink = _STAFF_SINK.replace('"', r'\"')
+    wh_esc = webhook_url.replace('"', r'\"')
+    config_script = (
+        f'<script>const SVRCFG={{'
+        f'"webhookUrl":"{wh_esc}",'
+        f'"outboundLive":{live},'
+        f'"staffSink":"{sink}",'
+        f'"secretSet":{secret_set}'
+        f'}};</script>'
+    )
+    return HTMLResponse(_HTML.replace("<!-- __SERVER_CONFIG__ -->", config_script))
+
+
 if __name__ == "__main__":
-    uvicorn.run("dashboard:app", host="0.0.0.0", port=8001, reload=True)
+    import uvicorn
+    uvicorn.run("dashboard:app", host="0.0.0.0", port=8080, reload=True)

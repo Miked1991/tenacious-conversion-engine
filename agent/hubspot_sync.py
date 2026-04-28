@@ -88,7 +88,22 @@ def upsert_contact(
                 json={"properties": props},
                 timeout=15,
             )
-            contact_id = resp.json().get("id", "")
+            # 409 = contact exists but search missed it (eventual consistency);
+            # extract the ID from the error and patch instead.
+            if resp.status_code == 409:
+                conflict_id = resp.json().get("message", "").split("Existing ID: ")[-1].strip()
+                if conflict_id and conflict_id.isdigit():
+                    resp = httpx.patch(
+                        f"{_BASE}/crm/v3/objects/contacts/{conflict_id}",
+                        headers=_HEADERS,
+                        json={"properties": props},
+                        timeout=15,
+                    )
+                    contact_id = resp.json().get("id", conflict_id)
+                else:
+                    contact_id = ""
+            else:
+                contact_id = resp.json().get("id", "")
     except Exception as exc:
         contact_id = ""
         log_span(trace_id, "hubspot_upsert_error", props, str(exc), level="ERROR")

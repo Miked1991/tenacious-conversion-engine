@@ -65,6 +65,16 @@ services:
       - key: DATABASE_URL
         sync: false
 
+      # ── Webhook base URL (set to your Render service URL after first deploy) ──
+      - key: WEBHOOK_BASE_URL
+        sync: false
+
+      # ── OpenRouter LLM base (mirrors OPENROUTER_API_KEY) ─────────────────────
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_API_BASE
+        value: https://openrouter.ai/api/v1
+
       # ── Cost guards ───────────────────────────────────────────────────────────
       - key: MAX_COST_PER_LEAD
         value: "5.0"

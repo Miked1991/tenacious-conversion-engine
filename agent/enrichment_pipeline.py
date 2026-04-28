@@ -128,19 +128,102 @@ def _is_recent_funding(date_str: str, months: int = 6) -> bool:
         return False
 
 
+_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data", "crunchbase", "crunchbase-companies-information.csv",
+)
+
+
+def _headcount_midpoint(band: str) -> int:
+    band = (band or "").strip()
+    m = re.match(r"(\d+)\s*[-–]\s*(\d+)", band)
+    if m:
+        return (int(m.group(1)) + int(m.group(2))) // 2
+    if band.isdigit():
+        return int(band)
+    return 0
+
+
+def _parse_funding_rounds_list(raw: str) -> tuple[str, int, float]:
+    try:
+        rounds = json.loads(raw) if raw.strip().startswith("[") else []
+    except Exception:
+        rounds = []
+    if not rounds:
+        return "", 0, 0.0
+    latest = rounds[-1] if isinstance(rounds[-1], dict) else {}
+    stage = latest.get("series") or latest.get("investment_type") or ""
+    total = sum(
+        float((r.get("money_raised") or {}).get("value_usd") or 0)
+        for r in rounds if isinstance(r, dict)
+    )
+    return stage, len(rounds), total
+
+
+def _domain_from_url(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    return url.split("/")[0].split("?")[0].lower()
+
+
+def _fetch_crunchbase_csv(domain: str) -> SignalResult:
+    """Read local Crunchbase CSV export and match by website domain."""
+    if not os.path.exists(_CSV_PATH):
+        return SignalResult(
+            value={"note": "local CSV not found"},
+            confidence=0.0,
+            source="crunchbase_csv_skipped",
+        )
+    try:
+        with open(_CSV_PATH, encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                website = row.get("website", "")
+                if not website:
+                    continue
+                row_domain = _domain_from_url(website)
+                # Match on exact domain or domain root (e.g. stripe.com == stripe.com)
+                if row_domain == domain or row_domain.split(".")[0] == domain.split(".")[0]:
+                    stage, num_rounds, total_usd = _parse_funding_rounds_list(
+                        row.get("funding_rounds_list", "")
+                    )
+                    headcount = _headcount_midpoint(row.get("num_employees", ""))
+                    return SignalResult(
+                        value={
+                            "domain": domain,
+                            "found": True,
+                            "company_name": row.get("name", "").strip(),
+                            "funding_stage": stage,
+                            "funding_rounds": num_rounds,
+                            "total_funding_usd": total_usd,
+                            "recently_funded": bool(stage),
+                            "headcount_band": row.get("num_employees", ""),
+                            "headcount": headcount,
+                        },
+                        confidence=0.85,
+                        source="crunchbase_csv_local",
+                    )
+    except Exception as exc:
+        return SignalResult(
+            value={"error": str(exc)},
+            confidence=0.0,
+            source="crunchbase_csv_error",
+        )
+    return SignalResult(
+        value={"domain": domain, "found": False},
+        confidence=0.3,
+        source="crunchbase_csv_local",
+    )
+
+
 def _fetch_crunchbase(domain: str) -> SignalResult:
     """
     Query Crunchbase API v4 (ODM) for funding stage, last-round date, and
-    headcount band.  Requires CRUNCHBASE_API_KEY env var (free Basic tier).
-    Returns confidence=0.0 when the key is absent so downstream code can fall
-    back to the LLM estimate.
+    headcount band.  Falls back to local CSV when CRUNCHBASE_API_KEY is absent.
     """
     if not _CB_KEY:
-        return SignalResult(
-            value={"note": "no CRUNCHBASE_API_KEY configured"},
-            confidence=0.0,
-            source="crunchbase_odm_skipped",
-        )
+        return _fetch_crunchbase_csv(domain)
     try:
         resp = httpx.post(
             "https://api.crunchbase.com/api/v4/searches/organizations",
@@ -558,6 +641,10 @@ def enrich(email: str) -> CompanyProfile:
             raw["funding_stage"] = cb_val["funding_stage"]
         if cb_val.get("recently_funded") is not None:
             raw["recently_funded"] = cb_val["recently_funded"]
+        if cb_val.get("company_name"):
+            raw["company_name"] = cb_val["company_name"]
+        if cb_val.get("headcount"):
+            raw["headcount"] = cb_val["headcount"]
 
     job_val = job_signal.value if isinstance(job_signal.value, dict) else {}
     if job_signal.confidence >= 0.4:

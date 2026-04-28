@@ -27,7 +27,8 @@ load_dotenv()
 _OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
 _DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 _RESEND_KEY = os.getenv("RESEND_API_KEY", "")
-_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
+_FROM_EMAIL  = os.getenv("RESEND_FROM_EMAIL", "Tenacious Outreach <onboarding@resend.dev>")
+_REPLY_TO    = os.getenv("RESEND_REPLY_TO", "")
 
 # Kill-switch (data policy rule 4): default OFF — routes all outbound to staff sink.
 # Set OUTBOUND_LIVE=true only after Tenacious executive team approval.
@@ -229,6 +230,8 @@ def send(to: str, subject: str, body: str, trace_id: str) -> dict:
         "text": body,
         "tags": [{"name": "draft", "value": "true"}],
     }
+    if _REPLY_TO:
+        payload["reply_to"] = [_REPLY_TO]
     if not _OUTBOUND_LIVE:
         payload["subject"] = f"[SINK:{to}] {subject}"
     try:

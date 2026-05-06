@@ -187,3 +187,14 @@ def save_lead(lead: Lead) -> None:
         row.booking_url        = lead.booking_url
         row.hubspot_contact_id = lead.hubspot_contact_id
         row.updated_at         = _now()
+
+
+def ping() -> bool:
+    """Return True when the database connection is healthy."""
+    try:
+        from sqlalchemy import text
+        with _engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False

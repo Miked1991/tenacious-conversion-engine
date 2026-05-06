@@ -12,7 +12,6 @@ has been removed; call db.save_lead(lead) after mutating a Lead object.
 """
 
 import os
-import re
 import time
 
 import httpx
@@ -20,6 +19,7 @@ from dotenv import load_dotenv
 
 from agent.db import Lead, LeadStatus, get_or_create, get_by_phone, link_phone, save_lead
 from agent.langfuse_logger import log_span
+from agent.retry import http_retry
 
 load_dotenv()
 
@@ -27,6 +27,7 @@ _OR_KEY    = os.getenv("OPENROUTER_API_KEY", "")
 _DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
 
 QUALIFY_AFTER_TURNS = 3
+MAX_HISTORY = 40  # cap entries to prevent unbounded growth (~20 exchange turns)
 
 # ── FM-3: system prompt includes offshore objection handling ──────────────────
 _SYSTEM_PROMPT = (
@@ -42,16 +43,23 @@ _SYSTEM_PROMPT = (
 )
 
 
+@http_retry
+def _conv_post(payload: dict, timeout: int = 40) -> httpx.Response:
+    return httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_OR_KEY}"},
+        json=payload,
+        timeout=timeout,
+    )
+
+
 def _llm_reply(history: list[dict], trace_id: str) -> str:
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + [
         {"role": m["role"], "content": m["content"]} for m in history
     ]
-
     try:
-        resp  = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {_OR_KEY}"},
-            json={
+        resp  = _conv_post(
+            {
                 "model":       _DEV_MODEL,
                 "messages":    messages,
                 "temperature": float(os.getenv("TEMPERATURE", "0.7")),
@@ -72,10 +80,8 @@ def _qualify(lead: Lead, trace_id: str) -> bool:
         f"{m['role'].upper()}: {m['content']}" for m in lead.history
     )
     try:
-        verdict = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {_OR_KEY}"},
-            json={
+        verdict = _conv_post(
+            {
                 "model":    _DEV_MODEL,
                 "messages": [
                     {
@@ -110,10 +116,13 @@ def handle_reply(email: str, text: str, trace_id: str) -> dict:
     agent_reply = _llm_reply(lead.history, trace_id)
     lead.history.append({"role": "assistant", "content": agent_reply, "ts": ts})
 
+    if len(lead.history) > MAX_HISTORY:
+        lead.history = lead.history[-MAX_HISTORY:]
+
     qualified = False
     if lead.turns >= QUALIFY_AFTER_TURNS:
         qualified   = _qualify(lead, trace_id)
-        lead.status = "qualified" if qualified else "in_conversation"
+        lead.status = "qualified" if qualified else "disqualified"
 
     save_lead(lead)
 

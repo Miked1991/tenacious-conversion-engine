@@ -12,7 +12,9 @@ Security
 --------
 /webhooks/email verifies Resend/Svix HMAC signatures when RESEND_WEBHOOK_SECRET
 is configured.  /webhooks/sms verifies the AT username in the payload.
-Both endpoints are rate-limited to 60 req/min per IP via slowapi.
+Both webhook endpoints are rate-limited to 60 req/min per IP via slowapi.
+/simulate and /simulate/sms require X-Simulate-Token header matching SIMULATE_TOKEN
+and are rate-limited to 10 req/min per IP.
 
 SMS channel hierarchy
 ---------------------
@@ -26,6 +28,7 @@ SMS channel hierarchy
       _run_reply_pipeline.
 """
 
+import asyncio
 import base64
 import dataclasses as _dc
 import hashlib
@@ -36,7 +39,7 @@ import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -58,6 +61,7 @@ from agent import signals_research as signals_mod
 _CALCOM_API_KEY        = os.getenv("CALCOM_API_KEY", "")
 _AT_USERNAME           = os.getenv("AFRICA_TALKING_USERNAME", "sandbox")
 _RESEND_WEBHOOK_SECRET = os.getenv("RESEND_WEBHOOK_SECRET", "")
+_SIMULATE_TOKEN        = os.getenv("SIMULATE_TOKEN", "")
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +123,33 @@ def _verify_resend_signature(headers: dict, raw_body: bytes) -> bool:
 def _verify_at_webhook(raw: dict) -> bool:
     """Verify Africa's Talking username in the webhook payload."""
     return raw.get("username") == _AT_USERNAME
+
+
+def _check_simulate_auth(request: Request):
+    """Return a 401/403 JSONResponse if the simulate token is missing or wrong."""
+    if not _SIMULATE_TOKEN:
+        return JSONResponse(
+            {"error": "SIMULATE_TOKEN not configured — set this env var to enable /simulate"},
+            status_code=403,
+        )
+    token = request.headers.get("X-Simulate-Token", "")
+    if not hmac.compare_digest(token.encode(), _SIMULATE_TOKEN.encode()):
+        return JSONResponse({"error": "invalid X-Simulate-Token"}, status_code=401)
+    return None
+
+
+# ── Background task error wrapper ─────────────────────────────────────────────
+
+def _run_bg(fn, *args, **kwargs) -> None:
+    """Run a background task and log any unhandled exception rather than dropping it."""
+    try:
+        fn(*args, **kwargs)
+    except Exception as exc:
+        logger.error(
+            "background_task_failed fn=%s err=%r",
+            getattr(fn, "__name__", repr(fn)), exc,
+            exc_info=True,
+        )
 
 
 # ── pipeline helpers ──────────────────────────────────────────────────────────
@@ -186,7 +217,11 @@ def _run_reply_pipeline(identifier: str, text: str) -> dict:
         name_parts     = identifier.split("@")[0].split(".") if "@" in identifier else [identifier]
         name           = " ".join(p.title() for p in name_parts)
         booking_result = booking.book(identifier, name, trace_id, api_key=_CALCOM_API_KEY)
-        lead.booking_url = booking_result.get("booking_url", "")
+
+        if booking_result.ok:
+            lead.booking_url = booking_result.data.get("booking_url", "")
+        else:
+            logger.error("booking_failed identifier=%s err=%s", identifier, booking_result.error)
 
         profile = lead.profile
         hs.upsert_contact(
@@ -201,17 +236,18 @@ def _run_reply_pipeline(identifier: str, text: str) -> dict:
             trace_id          = trace_id,
         )
 
-        if lead.phone and lead.booking_url:
+        if lead.phone and lead.booking_url and booking_result.ok:
             sms_confirmation = sms_mod.send_booking_confirmation_sms(
                 phone         = lead.phone,
-                booking_title = booking_result.get("title", "Discovery Call"),
-                start_time    = booking_result.get("start", ""),
+                booking_title = booking_result.data.get("title", "Discovery Call"),
+                start_time    = booking_result.data.get("start", ""),
                 booking_url   = lead.booking_url,
+                trace_id      = trace_id,
             )
             result["sms_confirmation"] = sms_confirmation
 
         result["booking_url"]    = lead.booking_url
-        result["booking_result"] = booking_result
+        result["booking_result"] = booking_result.to_dict()
         db.save_lead(lead)
 
     lf.log_trace("reply_complete", {"identifier": identifier}, result, session_id=lead.lead_id)
@@ -222,12 +258,38 @@ def _run_reply_pipeline(identifier: str, text: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    import httpx as _httpx
+    checks: dict[str, str] = {}
+
+    checks["database"]   = "ok" if db.ping() else "unreachable"
+    checks["langfuse"]   = (
+        "configured" if os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")
+        else "missing_credentials"
+    )
+    checks["resend"]     = "configured" if os.getenv("RESEND_API_KEY") else "missing_key"
+    checks["openrouter"] = "configured" if os.getenv("OPENROUTER_API_KEY") else "missing_key"
+
+    calcom_url = os.getenv("CALCOM_API_URL", "http://localhost:3000")
+    try:
+        _httpx.head(calcom_url, timeout=2)
+        checks["calcom"] = "reachable"
+    except Exception:
+        checks["calcom"] = "unreachable"
+
+    degraded = any(
+        v in ("unreachable", "missing_key", "missing_credentials")
+        for v in checks.values()
+    )
+    return JSONResponse(
+        {"status": "degraded" if degraded else "ok", "checks": checks,
+         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        status_code=503 if degraded else 200,
+    )
 
 
 @app.post("/webhooks/email")
 @limiter.limit("60/minute")
-async def webhook_email(request: Request):
+async def webhook_email(request: Request, background_tasks: BackgroundTasks):
     """
     Handle Resend webhook events.
 
@@ -291,16 +353,16 @@ async def webhook_email(request: Request):
 
     lead = db.get_or_create(email)
     if lead.status == "new" or not thread_id:
-        result = _run_full_pipeline(email, text)
+        background_tasks.add_task(_run_bg, _run_full_pipeline, email, text)
     else:
-        result = _run_reply_pipeline(email, text)
+        background_tasks.add_task(_run_bg, _run_reply_pipeline, email, text)
 
-    return JSONResponse(result)
+    return JSONResponse({"status": "accepted", "email": email}, status_code=202)
 
 
 @app.post("/webhooks/sms")
 @limiter.limit("60/minute")
-async def webhook_sms(request: Request):
+async def webhook_sms(request: Request, background_tasks: BackgroundTasks):
     """
     Africa's Talking inbound SMS callback.
 
@@ -353,7 +415,9 @@ async def webhook_sms(request: Request):
             status_code=200,
         )
 
-    result = sms_mod.handle_inbound_sms(
+    background_tasks.add_task(
+        _run_bg,
+        sms_mod.handle_inbound_sms,
         phone             = phone,
         text              = text,
         lead_status       = warm_lead.status,
@@ -361,25 +425,35 @@ async def webhook_sms(request: Request):
         reply_pipeline_fn = lambda _phone, _text: _run_reply_pipeline(warm_lead.email, _text),
     )
 
-    lf.log_trace("sms_complete", {"phone": phone}, result, session_id=warm_lead.lead_id)
-    return JSONResponse(result)
+    return JSONResponse({"status": "accepted", "phone": phone}, status_code=202)
 
 
 @app.post("/simulate")
+@limiter.limit("10/minute")
 async def simulate(request: Request):
-    """Inject a synthetic lead for end-to-end testing."""
-    body  = await request.json()
-    email = body.get("email", "prospect@example.com")
-    text  = body.get("text", "Tell me more about your engineering teams.")
-    return JSONResponse(_run_full_pipeline(email, text))
+    """Inject a synthetic lead for end-to-end testing. Requires X-Simulate-Token header."""
+    auth_err = _check_simulate_auth(request)
+    if auth_err:
+        return auth_err
+    body   = await request.json()
+    email  = body.get("email", "prospect@example.com")
+    text   = body.get("text", "Tell me more about your engineering teams.")
+    result = await asyncio.to_thread(_run_full_pipeline, email, text)
+    return JSONResponse(result)
 
 
 @app.post("/simulate/sms")
+@limiter.limit("10/minute")
 async def simulate_sms(request: Request):
     """
     Simulate an inbound AT SMS from a warm lead for integration testing.
-    Requires the lead to already exist (via /simulate or /webhooks/email).
+    Requires X-Simulate-Token header and the lead to already exist
+    (via /simulate or /webhooks/email).
     """
+    auth_err = _check_simulate_auth(request)
+    if auth_err:
+        return auth_err
+
     body  = await request.json()
     email = body.get("email", "")
     phone = body.get("phone", "")

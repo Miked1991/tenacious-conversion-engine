@@ -10,6 +10,8 @@ import httpx
 from dotenv import load_dotenv
 
 from agent.langfuse_logger import log_span
+from agent.retry import http_retry
+from agent.tool_result import ToolResult
 
 load_dotenv()
 
@@ -29,19 +31,25 @@ def _is_business_hours(iso_time: str) -> bool:
         return False
 
 
+@http_retry
+def _calcom_get(url: str, params: dict, headers: dict, timeout: int) -> httpx.Response:
+    return httpx.get(url, params=params, headers=headers, timeout=timeout)
+
+
+@http_retry
+def _calcom_post(url: str, headers: dict, json: dict, timeout: int) -> httpx.Response:
+    return httpx.post(url, headers=headers, json=json, timeout=timeout)
+
+
 def _next_available_slot(api_key: str, event_type_id: int) -> str | None:
     """Return the first business-hours slot available in the next 7 days."""
     start  = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime())
     end_ts = time.time() + 7 * 86400
     end    = time.strftime("%Y-%m-%dT23:59:59Z", time.gmtime(end_ts))
     try:
-        resp  = httpx.get(
+        resp = _calcom_get(
             f"{_CALCOM_URL}/api/v1/slots",
-            params={
-                "eventTypeId": event_type_id,
-                "startTime":   start,
-                "endTime":     end,
-            },
+            params={"eventTypeId": event_type_id, "startTime": start, "endTime": end},
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=15,
         )
@@ -57,8 +65,9 @@ def _next_available_slot(api_key: str, event_type_id: int) -> str | None:
 
 def _get_event_type_id(api_key: str) -> int | None:
     try:
-        resp = httpx.get(
+        resp = _calcom_get(
             f"{_CALCOM_URL}/api/v1/event-types",
+            params={},
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=10,
         )
@@ -70,22 +79,22 @@ def _get_event_type_id(api_key: str) -> int | None:
     return None
 
 
-def book(email: str, name: str, trace_id: str, api_key: str = "") -> dict:
+def book(email: str, name: str, trace_id: str, api_key: str = "") -> ToolResult:
     """
     Book a discovery call for the prospect.
-    Returns a dict with {success, booking_url, slot}.
-    Falls back gracefully if Cal.com is not reachable.
+    Returns ToolResult with data={booking_url, slot} on success.
+    Falls back gracefully if Cal.com is not reachable after retries.
     """
     event_type_id = _get_event_type_id(api_key) if api_key else None
     if event_type_id is None:
-        result = {"success": False, "booking_url": "", "slot": "", "error": "event type not found"}
-        log_span(trace_id, "book_call", {"email": email}, result)
+        result = ToolResult(ok=False, error="event type not found")
+        log_span(trace_id, "book_call", {"email": email}, result.to_dict())
         return result
 
     slot = _next_available_slot(api_key, event_type_id)
     if not slot:
-        result = {"success": False, "booking_url": "", "slot": "", "error": "no slots available"}
-        log_span(trace_id, "book_call", {"email": email}, result)
+        result = ToolResult(ok=False, error="no slots available")
+        log_span(trace_id, "book_call", {"email": email}, result.to_dict())
         return result
 
     payload = {
@@ -101,18 +110,18 @@ def book(email: str, name: str, trace_id: str, api_key: str = "") -> dict:
         "metadata": {},
     }
     try:
-        resp = httpx.post(
+        resp = _calcom_post(
             f"{_CALCOM_URL}/api/v1/bookings",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=20,
         )
         data = resp.json()
-        booking_url = data.get("uid", "")
-        booking_url = f"{_CALCOM_URL}/booking/{booking_url}" if booking_url else ""
-        result = {"success": True, "booking_url": booking_url, "slot": slot}
+        uid = data.get("uid", "")
+        booking_url = f"{_CALCOM_URL}/booking/{uid}" if uid else ""
+        result = ToolResult(ok=True, data={"booking_url": booking_url, "slot": slot})
     except Exception as exc:
-        result = {"success": False, "booking_url": "", "slot": slot, "error": str(exc)}
+        result = ToolResult(ok=False, error=str(exc))
 
-    log_span(trace_id, "book_call", payload, result)
+    log_span(trace_id, "book_call", payload, result.to_dict())
     return result

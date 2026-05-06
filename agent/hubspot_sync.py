@@ -9,24 +9,65 @@ import httpx
 from dotenv import load_dotenv
 
 from agent.langfuse_logger import log_span
+from agent.retry import http_retry
 
 load_dotenv()
 
-_TOKEN = os.getenv("HUBSPOT_ACCESS_TOKEN", "")
 _BASE = "https://api.hubapi.com"
 
-_HEADERS = {
-    "Authorization": f"Bearer {_TOKEN}",
-    "Content-Type": "application/json",
-}
+
+def _headers() -> dict:
+    """Build headers fresh each call so token rotation takes effect without restart."""
+    return {
+        "Authorization": f"Bearer {os.getenv('HUBSPOT_ACCESS_TOKEN', '')}",
+        "Content-Type": "application/json",
+    }
+
+
+@http_retry
+def _hs_search(payload: dict) -> httpx.Response:
+    return httpx.post(
+        f"{_BASE}/crm/v3/objects/contacts/search",
+        headers=_headers(),
+        json=payload,
+        timeout=15,
+    )
+
+
+@http_retry
+def _hs_create(payload: dict) -> httpx.Response:
+    return httpx.post(
+        f"{_BASE}/crm/v3/objects/contacts",
+        headers=_headers(),
+        json=payload,
+        timeout=15,
+    )
+
+
+@http_retry
+def _hs_patch(contact_id: str, payload: dict) -> httpx.Response:
+    return httpx.patch(
+        f"{_BASE}/crm/v3/objects/contacts/{contact_id}",
+        headers=_headers(),
+        json=payload,
+        timeout=15,
+    )
+
+
+@http_retry
+def _hs_engage(payload: dict) -> httpx.Response:
+    return httpx.post(
+        f"{_BASE}/engagements/v1/engagements",
+        headers=_headers(),
+        json=payload,
+        timeout=15,
+    )
 
 
 def _contact_id_by_email(email: str) -> str | None:
     try:
-        resp = httpx.post(
-            f"{_BASE}/crm/v3/objects/contacts/search",
-            headers=_HEADERS,
-            json={
+        resp = _hs_search(
+            {
                 "filterGroups": [
                     {
                         "filters": [
@@ -36,8 +77,7 @@ def _contact_id_by_email(email: str) -> str | None:
                 ],
                 "properties": ["email"],
                 "limit": 1,
-            },
-            timeout=15,
+            }
         )
         results = resp.json().get("results", [])
         return results[0]["id"] if results else None
@@ -74,33 +114,23 @@ def upsert_contact(
     existing_id = _contact_id_by_email(email)
     try:
         if existing_id:
-            resp = httpx.patch(
-                f"{_BASE}/crm/v3/objects/contacts/{existing_id}",
-                headers=_HEADERS,
-                json={"properties": props},
-                timeout=15,
-            )
+            resp = _hs_patch(existing_id, {"properties": props})
             contact_id = resp.json().get("id", existing_id)
         else:
-            resp = httpx.post(
-                f"{_BASE}/crm/v3/objects/contacts",
-                headers=_HEADERS,
-                json={"properties": props},
-                timeout=15,
-            )
-            # 409 = contact exists but search missed it (eventual consistency);
-            # extract the ID from the error and patch instead.
+            resp = _hs_create({"properties": props})
+            # 409 = contact exists but search missed it (eventual consistency)
             if resp.status_code == 409:
-                conflict_id = resp.json().get("message", "").split("Existing ID: ")[-1].strip()
+                msg   = resp.json().get("message", "")
+                parts = msg.split("Existing ID: ")
+                conflict_id = parts[-1].strip() if len(parts) > 1 else ""
                 if conflict_id and conflict_id.isdigit():
-                    resp = httpx.patch(
-                        f"{_BASE}/crm/v3/objects/contacts/{conflict_id}",
-                        headers=_HEADERS,
-                        json={"properties": props},
-                        timeout=15,
-                    )
+                    resp = _hs_patch(conflict_id, {"properties": props})
                     contact_id = resp.json().get("id", conflict_id)
                 else:
+                    log_span(
+                        trace_id, "hubspot_409_unparseable",
+                        {"email": email, "msg": msg}, {}, level="ERROR"
+                    )
                     contact_id = ""
             else:
                 contact_id = resp.json().get("id", "")
@@ -121,24 +151,26 @@ def mark_bounced(email: str, bounce_type: str, trace_id: str) -> None:
     soft             → hs_lead_status = ATTEMPTED_TO_CONTACT (allow retry)
     """
     status_map = {
-        "hard": "UNQUALIFIED",
+        "hard":      "UNQUALIFIED",
         "complaint": "UNQUALIFIED",
-        "soft": "ATTEMPTED_TO_CONTACT",
+        "soft":      "ATTEMPTED_TO_CONTACT",
     }
-    hs_status = status_map.get(bounce_type, "ATTEMPTED_TO_CONTACT")
+    hs_status  = status_map.get(bounce_type, "ATTEMPTED_TO_CONTACT")
     contact_id = _contact_id_by_email(email)
     if not contact_id:
         return
     try:
-        httpx.patch(
-            f"{_BASE}/crm/v3/objects/contacts/{contact_id}",
-            headers=_HEADERS,
-            json={"properties": {"hs_lead_status": hs_status}},
-            timeout=15,
+        _hs_patch(contact_id, {"properties": {"hs_lead_status": hs_status}})
+    except Exception as exc:
+        log_span(
+            trace_id, "hubspot_mark_bounced_error",
+            {"email": email, "bounce_type": bounce_type}, str(exc), level="ERROR"
         )
-    except Exception:
-        pass
-    log_span(trace_id, "hubspot_mark_bounced", {"email": email, "bounce_type": bounce_type}, {"hs_lead_status": hs_status})
+        return
+    log_span(
+        trace_id, "hubspot_mark_bounced",
+        {"email": email, "bounce_type": bounce_type}, {"hs_lead_status": hs_status}
+    )
 
 
 def log_email_activity(contact_id: str, subject: str, body: str, trace_id: str) -> None:
@@ -146,20 +178,16 @@ def log_email_activity(contact_id: str, subject: str, body: str, trace_id: str) 
         return
     payload = {
         "engagement": {
-            "active": True,
-            "type": "EMAIL",
+            "active":    True,
+            "type":      "EMAIL",
             "timestamp": int(time.time() * 1000),
         },
         "associations": {"contactIds": [int(contact_id)]},
-        "metadata": {"subject": subject, "text": body},
+        "metadata":     {"subject": subject, "text": body},
     }
     try:
-        httpx.post(
-            f"{_BASE}/engagements/v1/engagements",
-            headers=_HEADERS,
-            json=payload,
-            timeout=15,
-        )
-    except Exception:
-        pass
+        _hs_engage(payload)
+    except Exception as exc:
+        log_span(trace_id, "hubspot_log_email_error", payload, str(exc), level="ERROR")
+        return
     log_span(trace_id, "hubspot_log_email", payload, None)

@@ -43,6 +43,9 @@ from urllib.parse import urlencode
 import httpx
 from dotenv import load_dotenv
 
+from agent.langfuse_logger import log_span
+from agent.retry import http_retry
+
 load_dotenv()
 
 _AT_USERNAME = os.getenv("AFRICA_TALKING_USERNAME", "sandbox")
@@ -93,7 +96,21 @@ def parse_at_payload(raw: dict) -> dict:
 
 # ── Outbound SMS ─────────────────────────────────────────────────────────────
 
-def send_sms(phone: str, message: str) -> dict:
+@http_retry
+def _at_post(payload: dict) -> httpx.Response:
+    return httpx.post(
+        _AT_SMS_URL,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "apiKey": _AT_API_KEY,
+        },
+        content=urlencode(payload).encode(),
+        timeout=15,
+    )
+
+
+def send_sms(phone: str, message: str, trace_id: str = "") -> dict:
     """
     Send an outbound SMS via Africa's Talking.
 
@@ -111,19 +128,13 @@ def send_sms(phone: str, message: str) -> dict:
         payload["from"] = _AT_SENDER_ID
 
     try:
-        resp = httpx.post(
-            _AT_SMS_URL,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "apiKey": _AT_API_KEY,
-            },
-            content=urlencode(payload).encode(),
-            timeout=15,
-        )
-        return resp.json()
+        resp   = _at_post(payload)
+        result = resp.json()
     except Exception as exc:
-        return {"error": str(exc)}
+        result = {"error": str(exc)}
+    if trace_id:
+        log_span(trace_id, "send_sms", {"phone": phone, "message": message[:60]}, result)
+    return result
 
 
 def send_booking_confirmation_sms(
@@ -131,6 +142,7 @@ def send_booking_confirmation_sms(
     booking_title: str,
     start_time: str,
     booking_url: str,
+    trace_id: str = "",
 ) -> dict:
     """
     Send a Cal.com booking confirmation SMS to a warm lead's phone.
@@ -141,7 +153,7 @@ def send_booking_confirmation_sms(
         f"Starts {start_time}. "
         f"Manage at {booking_url}"
     )
-    return send_sms(phone, message)
+    return send_sms(phone, message, trace_id)
 
 
 # ── Inbound routing ──────────────────────────────────────────────────────────

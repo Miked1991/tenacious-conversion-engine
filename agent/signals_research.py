@@ -18,6 +18,8 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from agent.langfuse_logger import log_span
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "8000"))
@@ -182,6 +184,8 @@ def research(domain: str, trace_id: str = "") -> CompanySignals:
     Returns CompanySignals; never raises — errors land in .error field.
     """
     signals = CompanySignals()
+    if trace_id:
+        log_span(trace_id, "signals_research_start", {"domain": domain}, {})
     try:
         from playwright.sync_api import sync_playwright, Error as PwError
     except ImportError:
@@ -230,8 +234,15 @@ def research(domain: str, trace_id: str = "") -> CompanySignals:
             browser.close()
     except Exception as exc:
         signals.error = str(exc)
+        if trace_id:
+            log_span(
+                trace_id, "signals_research_error",
+                {"domain": domain}, {"error": str(exc)}, level="ERROR"
+            )
 
     if not signals.tagline and not signals.recent_post:
         logger.debug("signals_research: no content found for %s", domain)
 
+    if trace_id:
+        log_span(trace_id, "signals_research_done", {"domain": domain}, signals.to_dict())
     return signals

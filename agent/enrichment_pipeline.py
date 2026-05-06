@@ -21,11 +21,13 @@ Segment definitions  (names fixed for grading)
 """
 
 import csv
+import functools
 import io
 import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -34,6 +36,7 @@ import httpx
 from dotenv import load_dotenv
 
 from agent.ai_maturity import score_ai_maturity
+from agent.retry import http_retry
 
 load_dotenv()
 
@@ -217,40 +220,47 @@ def _fetch_crunchbase_csv(domain: str) -> SignalResult:
     )
 
 
+@http_retry
+def _crunchbase_post(body: dict) -> httpx.Response:
+    return httpx.post(
+        "https://api.crunchbase.com/api/v4/searches/organizations",
+        params={"user_key": _CB_KEY},
+        json=body,
+        timeout=15,
+    )
+
+
+@functools.lru_cache(maxsize=256)
 def _fetch_crunchbase(domain: str) -> SignalResult:
     """
     Query Crunchbase API v4 (ODM) for funding stage, last-round date, and
     headcount band.  Falls back to local CSV when CRUNCHBASE_API_KEY is absent.
+    Results are cached in-process for the lifetime of the worker.
     """
     if not _CB_KEY:
         return _fetch_crunchbase_csv(domain)
     try:
-        resp = httpx.post(
-            "https://api.crunchbase.com/api/v4/searches/organizations",
-            params={"user_key": _CB_KEY},
-            json={
-                "field_ids": [
-                    "identifier", "funding_total", "last_funding_type",
-                    "last_funding_at", "num_employees_enum", "num_funding_rounds",
-                ],
-                "query": [
-                    {
-                        "type": "predicate",
-                        "field_id": "facet_ids",
-                        "operator_id": "includes",
-                        "values": ["company"],
-                    },
-                    {
-                        "type": "predicate",
-                        "field_id": "domain",
-                        "operator_id": "includes",
-                        "values": [domain],
-                    },
-                ],
-                "limit": 1,
-            },
-            timeout=15,
-        )
+        resp = _crunchbase_post({
+            "field_ids": [
+                "identifier", "funding_total", "last_funding_type",
+                "last_funding_at", "num_employees_enum", "num_funding_rounds",
+            ],
+            "query": [
+                {
+                    "type": "predicate",
+                    "field_id": "facet_ids",
+                    "operator_id": "includes",
+                    "values": ["company"],
+                },
+                {
+                    "type": "predicate",
+                    "field_id": "domain",
+                    "operator_id": "includes",
+                    "values": [domain],
+                },
+            ],
+            "limit": 1,
+        })
         data = resp.json()
         entities = data.get("entities", [])
         if not entities:
@@ -382,13 +392,20 @@ def _layoffs_within_120_days(events: list[dict]) -> bool:
     return False
 
 
+@http_retry
+def _layoffs_get() -> httpx.Response:
+    return httpx.get(_LAYOFFS_CSV_URL, timeout=15, follow_redirects=True)
+
+
+@functools.lru_cache(maxsize=256)
 def _parse_layoffs_fyi(company_name: str, domain: str) -> SignalResult:
     """
     Fetch the public layoffs.fyi Google Sheets CSV export and search for the
     target company by name or domain root.  No authentication is required.
+    Results are cached in-process for the lifetime of the worker.
     """
     try:
-        resp = httpx.get(_LAYOFFS_CSV_URL, timeout=15, follow_redirects=True)
+        resp = _layoffs_get()
         if resp.status_code != 200:
             return SignalResult(
                 value={"note": f"layoffs.fyi HTTP {resp.status_code}"},
@@ -445,6 +462,16 @@ def _days_since(date_str: str) -> int:
     return 999
 
 
+@http_retry
+def _pdl_post(api_key: str, body: dict) -> httpx.Response:
+    return httpx.post(
+        "https://api.peopledatalabs.com/v5/person/search",
+        headers={"X-Api-Key": api_key},
+        json=body,
+        timeout=15,
+    )
+
+
 def _detect_leadership_change(domain: str) -> SignalResult:
     """
     Query People Data Labs (PDL) /v5/person/search for recent C-suite / VP /
@@ -472,27 +499,22 @@ def _detect_leadership_change(domain: str) -> SignalResult:
     ).strftime("%Y-%m-%d")
 
     try:
-        resp = httpx.post(
-            "https://api.peopledatalabs.com/v5/person/search",
-            headers={"X-Api-Key": _PDL_KEY},
-            json={
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"term": {"job_company_website": domain}},
-                            {"terms": {"job_title_levels": ["c_suite", "vp", "director"]}},
-                            {"range": {"job_start_date": {"gte": cutoff_date}}},
-                        ]
-                    }
-                },
-                "size": 5,
-                "fields": [
-                    "full_name", "job_title", "job_title_levels",
-                    "job_start_date", "experience",
-                ],
+        resp = _pdl_post(_PDL_KEY, {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"job_company_website": domain}},
+                        {"terms": {"job_title_levels": ["c_suite", "vp", "director"]}},
+                        {"range": {"job_start_date": {"gte": cutoff_date}}},
+                    ]
+                }
             },
-            timeout=15,
-        )
+            "size": 5,
+            "fields": [
+                "full_name", "job_title", "job_title_levels",
+                "job_start_date", "experience",
+            ],
+        })
         data = resp.json()
         if resp.status_code != 200:
             return SignalResult(
@@ -534,6 +556,21 @@ def _detect_leadership_change(domain: str) -> SignalResult:
 
 # ── LLM fallback enrichment ──────────────────────────────────────────────────
 
+@http_retry
+def _llm_enrich_post(prompt: str) -> httpx.Response:
+    return httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_OR_KEY}"},
+        json={
+            "model": _DEV_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 300,
+        },
+        timeout=30,
+    )
+
+
 def _llm_enrich(domain: str, signal_context: str = "") -> dict:
     """
     Synthesise a company profile via LLM, informed by any real signals already
@@ -553,17 +590,7 @@ def _llm_enrich(domain: str, signal_context: str = "") -> dict:
         "If the domain is completely unknown, make reasonable guesses for a mid-size SaaS company."
     )
     try:
-        resp = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {_OR_KEY}"},
-            json={
-                "model": _DEV_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 300,
-            },
-            timeout=30,
-        )
+        resp = _llm_enrich_post(prompt)
         text = resp.json()["choices"][0]["message"]["content"]
         text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         return json.loads(text)
@@ -618,10 +645,31 @@ def enrich(email: str) -> CompanyProfile:
     """
     domain = _extract_domain(email)
 
-    cb_signal = _fetch_crunchbase(domain)
-    job_signal = _scrape_job_posts(domain)
-    layoffs_sig = _parse_layoffs_fyi(domain.split(".")[0].title(), domain)
-    leadership_sig = _detect_leadership_change(domain)
+    # Run the four independent signal sources concurrently.
+    # _scrape_job_posts is Playwright (stateful per-thread); the others are HTTP.
+    # Each thread gets its own Playwright context so concurrent execution is safe.
+    _tasks = {
+        "cb":         lambda: _fetch_crunchbase(domain),
+        "jobs":       lambda: _scrape_job_posts(domain),
+        "layoffs":    lambda: _parse_layoffs_fyi(domain.split(".")[0].title(), domain),
+        "leadership": lambda: _detect_leadership_change(domain),
+    }
+    _signal_results: dict[str, SignalResult] = {}
+    with ThreadPoolExecutor(max_workers=4) as _pool:
+        _futures = {_pool.submit(fn): key for key, fn in _tasks.items()}
+        for _future in as_completed(_futures):
+            _key = _futures[_future]
+            try:
+                _signal_results[_key] = _future.result()
+            except Exception as _exc:
+                _signal_results[_key] = SignalResult(
+                    value={"error": str(_exc)}, confidence=0.0, source=f"{_key}_error"
+                )
+
+    cb_signal      = _signal_results["cb"]
+    job_signal     = _signal_results["jobs"]
+    layoffs_sig    = _signal_results["layoffs"]
+    leadership_sig = _signal_results["leadership"]
 
     # Build context string for LLM from high-confidence real signals
     ctx_parts = []

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from agent.enrichment_pipeline import CompanyProfile
 from agent.langfuse_logger import log_span
+from agent.retry import http_retry
 
 load_dotenv()
 
@@ -34,6 +35,15 @@ _REPLY_TO    = os.getenv("RESEND_REPLY_TO", "")
 # Set OUTBOUND_LIVE=true only after Tenacious executive team approval.
 _OUTBOUND_LIVE = os.getenv("OUTBOUND_LIVE", "false").lower() in ("1", "true", "yes")
 _STAFF_SINK = os.getenv("STAFF_SINK_EMAIL", "sink@tenacious-pilot.dev")
+
+# Startup guard: require explicit approval evidence before going live.
+# Prevents accidental live sends if OUTBOUND_LIVE leaks into staging.
+if _OUTBOUND_LIVE and not os.getenv("OUTBOUND_LIVE_APPROVED_BY"):
+    raise RuntimeError(
+        "OUTBOUND_LIVE=true requires OUTBOUND_LIVE_APPROVED_BY env var "
+        "(e.g. 'cto@tenacious.io 2026-05-06') for audit trail. "
+        "Set both in your deployment config before going live."
+    )
 
 BounceType = Literal["hard", "soft", "complaint"]
 
@@ -121,19 +131,24 @@ def _deterministic_tone_check(subject: str, body: str) -> tuple[bool, list[str]]
     return len(violations) == 0, violations
 
 
+@http_retry
+def _llm_post(messages: list, max_tokens: int) -> httpx.Response:
+    return httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_OR_KEY}"},
+        json={
+            "model": _DEV_MODEL,
+            "messages": messages,
+            "temperature": float(os.getenv("TEMPERATURE", "0.7")),
+            "max_tokens": max_tokens,
+        },
+        timeout=40,
+    )
+
+
 def _llm(messages: list, max_tokens: int = 400) -> str:
     try:
-        resp = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {_OR_KEY}"},
-            json={
-                "model": _DEV_MODEL,
-                "messages": messages,
-                "temperature": float(os.getenv("TEMPERATURE", "0.7")),
-                "max_tokens": max_tokens,
-            },
-            timeout=40,
-        )
+        resp = _llm_post(messages, max_tokens)
         data = resp.json()
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
@@ -220,6 +235,16 @@ def tone_check(subject: str, body: str, trace_id: str) -> bool:
     return ok
 
 
+@http_retry
+def _resend_post(payload: dict) -> httpx.Response:
+    return httpx.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {_RESEND_KEY}"},
+        json=payload,
+        timeout=20,
+    )
+
+
 def send(to: str, subject: str, body: str, trace_id: str) -> dict:
     """Send via Resend. Routes to staff sink unless OUTBOUND_LIVE=true."""
     actual_to = to if _OUTBOUND_LIVE else _STAFF_SINK
@@ -235,12 +260,7 @@ def send(to: str, subject: str, body: str, trace_id: str) -> dict:
     if not _OUTBOUND_LIVE:
         payload["subject"] = f"[SINK:{to}] {subject}"
     try:
-        resp = httpx.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {_RESEND_KEY}"},
-            json=payload,
-            timeout=20,
-        )
+        resp = _resend_post(payload)
         result = resp.json()
     except Exception as exc:
         result = {"error": str(exc)}

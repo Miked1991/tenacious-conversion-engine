@@ -9,7 +9,7 @@ Output schema
   "prospect":          str,
   "domain":            str,
   "industry":          str,          # inferred from job titles / domain
-  "segment":           str,          # generic | recently_funded | post_layoff | hypergrowth
+  "segment":           str,          # generic | recently_funded | restructuring_cost | leadership_transition | capability_gap
   "ai_maturity_score": int,          # 0–3
   "competitors": [
     {
@@ -46,12 +46,13 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from agent.email_outreach import SEGMENT_LABELS as _SEGMENT_LABELS
+from agent.retry import http_retry
+
 load_dotenv()
 
 _OR_KEY    = os.getenv("OPENROUTER_API_KEY", "")
 _DEV_MODEL = os.getenv("DEV_MODEL", "openai/gpt-4o-mini")
-
-_SEGMENT_LABELS = {0: "generic", 1: "recently_funded", 2: "post_layoff", 3: "hypergrowth"}
 
 # ── Tenacious capability summary injected into every brief ────────────────────
 _TENACIOUS_BRIEF = (
@@ -155,6 +156,16 @@ _FALLBACK_COMPETITORS: list[dict] = [
 ]
 
 
+@http_retry
+def _gap_post(payload: dict) -> httpx.Response:
+    return httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_OR_KEY}"},
+        json=payload,
+        timeout=45,
+    )
+
+
 def generate_competitor_gap_brief(
     profile: Any,
     trace_id: str,
@@ -248,18 +259,13 @@ Return ONLY a valid JSON object — no markdown fences, no commentary:
 
     if _OR_KEY:
         try:
-            resp = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {_OR_KEY}"},
-                json={
-                    "model":           _DEV_MODEL,
-                    "messages":        [{"role": "user", "content": prompt}],
-                    "temperature":     0.3,
-                    "max_tokens":      900,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=45,
-            )
+            resp = _gap_post({
+                "model":           _DEV_MODEL,
+                "messages":        [{"role": "user", "content": prompt}],
+                "temperature":     0.3,
+                "max_tokens":      900,
+                "response_format": {"type": "json_object"},
+            })
             raw_text = resp.json()["choices"][0]["message"]["content"].strip()
             # Strip any accidental markdown fences
             raw_text = raw_text.lstrip("```json").lstrip("```").rstrip("```").strip()
